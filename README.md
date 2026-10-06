@@ -83,6 +83,10 @@ cd cloudflare && npx wrangler deploy
 export http_proxy=http://127.0.0.1:<当前端口> https_proxy=http://127.0.0.1:<当前端口>
 ```
 
+（`npm ci` 也一样 —— lock 里指向官方 `registry.npmjs.org`，不走镜像。
+只是为了对齐 CI，本地临时救急可以用
+`npm ci --registry=https://registry.npmmirror.com`。）
+
 ⚠ 代理会**间歇性抖**（`timed out` / `CONNECT tunnel failed, response 502`），
 **循环重试 2~3 次必过**，不用改配置。
 
