@@ -1,0 +1,469 @@
+/* ===========================================================================
+   RoomTalk · 样式
+   目标：首屏只有一件事要用户做（输口令），进入后只有一件事要用户做（说话）。
+   =========================================================================== */
+
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #f0f1f4;
+  --text: #14171a;
+  --muted: #697586;
+  --line: #e3e6ea;
+  --accent: #2f6df6;
+  --accent-ink: #ffffff;
+  --ok: #12a150;
+  --warn: #e08d0b;
+  --danger: #d93a3a;
+  --radius: 14px;
+  --radius-sm: 10px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px rgba(16, 24, 40, .06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #171a21;
+    --surface-2: #1e222b;
+    --text: #e8eaed;
+    --muted: #98a2b3;
+    --line: #262b36;
+    --accent: #4a83ff;
+    --ok: #2fbf6d;
+    --warn: #e8a33d;
+    --danger: #f05656;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 8px 24px rgba(0, 0, 0, .35);
+  }
+}
+
+[hidden] { display: none !important; }   /* 必须！类选择器的 display 会压过 UA 的 [hidden] */
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overscroll-behavior: none;
+}
+
+button, input { font: inherit; color: inherit; }
+
+button { cursor: pointer; }
+
+/* ============================ 按钮 ============================ */
+
+.primary {
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: 11px 18px;
+  font-weight: 600;
+  transition: filter .15s, opacity .15s;
+}
+.primary:hover:not(:disabled) { filter: brightness(1.06); }
+.primary:disabled { opacity: .45; cursor: default; }
+
+.icon {
+  width: 38px; height: 38px;
+  display: grid; place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+  font-size: 16px;
+  line-height: 1;
+  transition: background .15s, border-color .15s, transform .1s;
+}
+.icon:hover { background: var(--surface-2); }
+.icon:active { transform: scale(.94); }
+.icon.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.icon.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--line)); }
+.icon.danger:hover { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
+
+/* 画质档位。刻意用原生 select 而不是自绘菜单：
+   手机上点开就是系统选择器，可点区域大、不用自己处理定位和点外关闭。 */
+.quality {
+  flex: none;
+  height: 38px;
+  padding: 0 6px 0 9px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 19px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.quality:hover { background: var(--surface-2); }
+.quality:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 行内小按钮（身份提示条上用） */
+.mini {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  padding: 4px 11px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  transition: background .15s, border-color .15s;
+}
+.mini:hover { background: var(--surface-2); }
+.mini.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+}
+.mini.danger:hover { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
+
+/* ============================ 入口 ============================ */
+
+.gate {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 24px;
+}
+
+.card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 30px 26px 26px;
+}
+
+.card h1 {
+  margin: 0 0 6px;
+  font-size: 21px;
+  font-weight: 650;
+  letter-spacing: .01em;
+  text-align: center;
+}
+
+.lede {
+  margin: 0 0 22px;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+.field {
+  position: relative;
+  margin-bottom: 14px;
+}
+
+.field input {
+  width: 100%;
+  padding: 12px 62px 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  outline: none;
+  transition: border-color .15s, background .15s;
+}
+.field input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.field input::placeholder { color: var(--muted); }
+
+.reveal {
+  position: absolute;
+  top: 50%; right: 8px;
+  transform: translateY(-50%);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.reveal:hover { color: var(--text); background: var(--surface-2); }
+
+.card .primary { width: 100%; }
+
+.hint {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.error {
+  margin: 12px 0 0;
+  color: var(--danger);
+  font-size: 13px;
+  text-align: center;
+}
+
+.foot {
+  max-width: 420px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.7;
+  text-align: center;
+}
+
+/* 页脚：隐私说明 + 联系方式。包一层，免得 .gate 的 22px 间距把两段小字撑开。 */
+.page-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 420px;
+}
+
+.contact {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.8;
+  text-align: center;
+}
+.contact a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, currentColor 32%, transparent);
+}
+.contact a:hover { color: var(--text); }
+
+/* ============================ 房间 ============================ */
+
+.room {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  padding-top: max(10px, env(safe-area-inset-top));
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.dot {
+  flex: none;
+  width: 10px; height: 10px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background .2s;
+}
+.dot.waiting { background: var(--warn); animation: pulse 1.8s ease-in-out infinite; }
+.dot.online  { background: var(--ok); }
+.dot.warn    { background: var(--danger); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .3; }
+}
+
+.status {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar-actions { display: flex; gap: 8px; }
+
+/* ---------------------------- 对方身份提示条 ---------------------------- */
+
+.trust {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.trust.new {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--text);
+}
+.trust.warn {
+  background: color-mix(in srgb, var(--warn) 14%, var(--surface));
+  color: var(--text);
+}
+.trust-text { flex: 1; min-width: 0; }
+.trust-actions { display: flex; gap: 6px; flex: none; }
+
+/* ---------------------------- 视频舞台 ---------------------------- */
+
+.stage {
+  flex: none;
+  position: relative;
+  background: #0b0d11;
+  aspect-ratio: 16 / 10;
+  max-height: 44dvh;
+  overflow: hidden;
+}
+@media (orientation: portrait) {
+  .stage { aspect-ratio: 3 / 4; max-height: 40dvh; }
+}
+
+.stage video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #0b0d11;
+}
+
+.stage .remote { position: absolute; inset: 0; }
+
+.stage .local {
+  position: absolute;
+  right: 10px; bottom: 10px;
+  width: 26%;
+  max-width: 130px;
+  aspect-ratio: 3 / 4;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .4);
+}
+
+.stage-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8a93a3;
+  font-size: 13px;
+  pointer-events: none;
+}
+
+/* ---------------------------- 消息 ---------------------------- */
+
+.log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+}
+
+.msg {
+  max-width: min(78%, 560px);
+  padding: 9px 13px;
+  border-radius: 16px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  animation: rise .16s ease-out;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.msg.me {
+  align-self: flex-end;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-bottom-right-radius: 5px;
+}
+
+.msg.them {
+  align-self: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 5px;
+}
+
+.notice {
+  align-self: center;
+  max-width: 90%;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ---------------------------- 输入栏 ---------------------------- */
+
+.composer {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  padding-bottom: max(10px, env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+}
+
+.composer input {
+  flex: 1;
+  min-width: 0;
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  outline: none;
+  transition: border-color .15s, background .15s;
+}
+.composer input:focus { border-color: var(--accent); background: var(--surface); }
+.composer input::placeholder { color: var(--muted); }
+
+.composer .primary {
+  flex: none;
+  border-radius: 999px;
+  padding: 11px 20px;
+}
+
+/* ============================ 浮层提示 ============================ */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: max(78px, calc(env(safe-area-inset-bottom) + 78px));
+  transform: translateX(-50%);
+  max-width: min(88vw, 420px);
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: rgba(20, 23, 26, .92);
+  color: #fff;
+  font-size: 13px;
+  text-align: center;
+  z-index: 20;
+  animation: rise .18s ease-out;
+}

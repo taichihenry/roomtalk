@@ -1,0 +1,77 @@
+# RoomTalk · Cloudflare Workers 配置
+# ---------------------------------------------------------------------------
+# 部署：在本目录执行 `npx wrangler deploy`
+#
+# 绑定自定义域名时，取消 routes 段的注释并改成你自己的域名（写 ASCII / punycode）。
+# custom_domain = true 会让 Cloudflare 自动签发证书 + 建 DNS 记录，
+# 不需要手动去 DNS 面板加 CNAME。
+
+name = "roomtalk"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# 保留 *.workers.dev 备用入口（海外可直连；国内被 DNS 污染，仅作验证用）
+workers_dev = true
+
+# ---------------------------- 自定义域名 ----------------------------
+# 8.中国 的 punycode 是 8.xn--fiqs8s（wrangler 里必须写 ASCII 形式）。
+# custom_domain = true 表示由 Cloudflare 自动签发证书 + 建 DNS 记录，
+# 不需要手动去 DNS 面板加 CNAME —— 面板上「缺少 A / CNAME / MX」的扫描提示
+# 对 Worker 站点是误报，**一律忽略，不要手动补**。
+#
+# 为什么是四条而不是一条：
+#   ① www 必须单独列：DNS 里没有「自动补 www」这回事，www.8.中国 是个三级域名，
+#      跟 8.中国 是两个完全不同的名字，不显式绑定就一直 ENOTFOUND。
+#   ② 繁体 8.中國 也必须单独列：.中國(xn--fiqz9s) 和 .中国(xn--fiqs8s) 是
+#      **两个不同的顶级域**，CNNIC 那边简繁共用一份注册数据（所以 NS 一起改），
+#      但在 Cloudflare 是各自独立的 zone，DNS 层面互不相认。
+#   两条都绑好之后，由 src/index.js 里的域名归一逻辑把 www / 繁体统一 301 到
+#   简体裸域 —— 房间号存在 sessionStorage（按 origin 隔离），不归一就会出现
+#   「换个写法打开、房间没了」。
+routes = [
+  { pattern = "8.xn--fiqs8s",     custom_domain = true },  # 8.中国
+  { pattern = "www.8.xn--fiqs8s", custom_domain = true },  # www.8.中国
+  { pattern = "8.xn--fiqz9s",     custom_domain = true },  # 8.中國（繁体）
+  { pattern = "www.8.xn--fiqz9s", custom_domain = true }   # www.8.中國（繁体）
+]
+
+# ---------------------------- 静态资源 ----------------------------
+# 前端是纯静态页面，直接由 Assets 命中，**不进 Worker、不计费**。
+[assets]
+directory = "../public"
+binding = "ASSETS"
+# 不做 SPA 回退：找不到就是 404，避免把 /ws 这类路径错误地回成 index.html
+not_found_handling = "none"
+
+# ⚠ 首页必须让 Worker 先处理，否则域名归一是摆设。
+#
+# Assets 的默认策略是「静态资源优先」：请求路径若能命中一个静态文件，
+# 就直接由 Assets 返回，**Worker 一行都不执行**（这是省计费的设计）。
+# 于是 "/" 命中 index.html → 归一逻辑被跳过；而 /healthz 没有对应文件，
+# 所以它能正常 301 —— 这个差异正是排查时的突破口。
+#
+# 这里只放行两个路径，app.js / app.css 仍然直连 Assets 不进 Worker，
+# 所以代价极小（每次首页访问多一次请求，免费额度是 10 万/天）。
+run_worker_first = ["/", "/index.html"]
+
+# ---------------------------- Durable Object ----------------------------
+# 全局单一实例承载整张房间表。理由见 src/room.js 顶部注释。
+[[durable_objects.bindings]]
+name = "SIGNAL"
+class_name = "SignalRoom"
+
+[[migrations]]
+tag = "v1"
+# 免费计划只支持 SQLite 后端的 DO（硬性要求，写成 new_classes 会部署失败）
+new_sqlite_classes = ["SignalRoom"]
+
+# ------------------------------- 变量 -------------------------------
+[vars]
+# 全局连接数上限（本实例）。超出直接回 503，防止一条脚本把单实例打满。
+MAX_CONNECTIONS = "2000"
+# 全局房间数上限。挡的是「新建房间」，已在册的房间仍可进入。
+MAX_ROOMS_TOTAL = "5000"
+
+# ------------------------------ 可观测性 ------------------------------
+[observability]
+enabled = true

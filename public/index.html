@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow,noarchive,noimageindex">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="和对方约定一串口令，输入即接通。文字、语音、视频点对点直达，服务器不经手、不存储。">
+<title>暗号 · 口令通话</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Cpath d='M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z' fill='%23fff' opacity='.92'/%3E%3Ccircle cx='43' cy='24' r='7' fill='none' stroke='%23fff' stroke-width='3.4'/%3E%3Cpath d='M43 31v6' stroke='%23fff' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求 -->
+<link rel="preload" href="app.js" as="script">
+</head>
+<body>
+
+<!-- ============================ 入口 ============================ -->
+<main id="gate" class="gate">
+  <form id="gate-form" class="card" autocomplete="off" novalidate>
+    <h1>口令通话</h1>
+    <p class="lede">和对方输入同一串口令，即可接通。</p>
+
+    <div class="field">
+      <input id="passphrase" type="password" placeholder="输入你们的暗号"
+             autocomplete="new-password" autocapitalize="off" autocorrect="off"
+             spellcheck="false" maxlength="128" enterkeyhint="go" aria-label="口令">
+      <button type="button" id="toggle-pass" class="reveal" aria-label="显示口令">显示</button>
+    </div>
+
+    <p class="hint">
+      口令越独特越安全。太短或太常见的口令，可能正被别人用着 ——
+      那样双方会撞进同一个房间。
+    </p>
+
+    <button type="submit" id="gate-submit" class="primary">进入</button>
+    <p id="gate-error" class="error" hidden role="alert"></p>
+  </form>
+
+  <footer class="page-foot">
+    <p class="foot">
+      口令不会离开这台设备——浏览器只在本地把它算成房间号，服务器不知道你们约定了什么，
+      也无从反推。通话建立后，消息与音视频在你们两台设备之间直接传输。
+    </p>
+
+    <p class="contact">
+      Mobile：<a href="tel:+8613810632766">+86 13810632766</a><br>
+      Email：<a href="mailto:153764384@qq.com">153764384@qq.com</a>
+    </p>
+  </footer>
+</main>
+
+<!-- ============================ 房间 ============================ -->
+<main id="room" class="room" hidden>
+  <header class="bar">
+    <button id="dot" class="dot" type="button" aria-label="连接状态"></button>
+    <span id="status" class="status">正在连接…</span>
+    <div class="bar-actions">
+      <!-- 画质档位：管的是「我发出去的」画面，省的是我自己的流量。
+           放在工具栏而不是藏在设置里 —— 通话中随时想调，伸手就够得着。 -->
+      <select id="video-quality" class="quality" aria-label="我发出的画质"
+              title="我发出的画质。档位越低越省流量、也越不容易卡。">
+        <option value="saver">省流量</option>
+        <option value="smooth">流畅</option>
+        <option value="sharp">清晰</option>
+      </select>
+      <button id="btn-mic" class="icon" type="button" title="语音" aria-label="语音" aria-pressed="false">🎙</button>
+      <button id="btn-cam" class="icon" type="button" title="视频" aria-label="视频" aria-pressed="false">📷</button>
+      <button id="btn-hangup" class="icon danger" type="button" title="退出" aria-label="退出">✕</button>
+    </div>
+  </header>
+
+  <div id="trust" class="trust" hidden>
+    <span id="trust-text" class="trust-text"></span>
+    <span class="trust-actions">
+      <button id="trust-keep" type="button" class="mini" hidden>记住这台</button>
+      <button id="trust-kick" type="button" class="mini danger" hidden>请出房间</button>
+    </span>
+  </div>
+
+  <div id="stage" class="stage" hidden>
+    <video id="remote-video" class="remote" autoplay playsinline></video>
+    <div id="stage-empty" class="stage-empty">对方还没打开摄像头</div>
+    <video id="local-video" class="local" autoplay playsinline muted></video>
+  </div>
+
+  <div id="log" class="log" role="log" aria-live="polite"></div>
+
+  <form id="composer" class="composer" autocomplete="off">
+    <input id="text" type="text" placeholder="输入消息…" autocomplete="off"
+           maxlength="2000" enterkeyhint="send" aria-label="消息内容">
+    <button type="submit" id="btn-send" class="primary" disabled>发送</button>
+  </form>
+</main>
+
+<div id="toast" class="toast" hidden role="status"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

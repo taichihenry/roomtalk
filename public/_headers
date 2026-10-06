@@ -1,0 +1,44 @@
+# RoomTalk · Cloudflare Workers Static Assets 的响应头
+#
+# ⚠ 注释只能用 #，不能写块注释 —— 引擎会把块注释的开头当成路径匹配符，
+#   后面所有内容解析失败。它**只报 warning、不影响启动**，规则却静默失效。
+#
+# ⚠ 本文件只对「由 static-assets binding 产出」的响应生效。
+#   Worker 里用 new Response() 直接生成的响应（/ws、/healthz）不套用这里的规则。
+#
+# ⚠ CSP 生效 + 页面有内联脚本 = 白屏（script-src 'self' 会静默拦掉内联脚本，
+#   只在控制台留一句 Refused）。所以 index.html 里没有任何内联 <script>。
+#
+# ⚠ 路径规则后面缩进的行都是它的响应头，直到下一个不缩进的行为止。
+#   同时匹配多条时，**写在后面的覆盖前面的** —— 所以具体路径要放在 /* 之后。
+
+/*
+  # 一年内强制 HTTPS。故意**不写 includeSubDomains**：一旦写死，
+  # 以后若某个子域只想跑 http 就再也降不回来了，而收益几乎为零
+  # （本站在 Cloudflare 上本来就只出口 https）。
+  Strict-Transport-Security: max-age=31536000
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  X-Frame-Options: DENY
+  Permissions-Policy: geolocation=(), microphone=(self), camera=(self), payment=(), usb=()
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' wss:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+
+# ---------------------------------------------------------------------------
+# 静态资源缓存
+#
+# 默认的 max-age=0, must-revalidate 意味着回访用户每次都要发一次条件请求、
+# 等一个完整往返才能用上缓存 —— 移动网络下白等 50~100ms。
+# 给 10 分钟，同一用户刷新页面、反复进出房间都不再走网络。
+#
+# 为什么不是「一年 + immutable」：文件名没带内容哈希，改版后老用户会一直
+# 拿到旧文件。10 分钟是「省掉往返」与「更新及时」之间的折中。
+#
+# index.html 保持不缓存（沿用上面的默认值）—— 它必须是最新的，
+# 否则用户会被钉在旧版本上，连新版资源都拿不到。
+# ---------------------------------------------------------------------------
+
+/app.js
+  Cache-Control: public, max-age=600
+
+/app.css
+  Cache-Control: public, max-age=600

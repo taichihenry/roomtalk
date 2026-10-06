@@ -1,0 +1,8 @@
+# 这个仓库会在 Linux 构建环境里跑（Cloudflare Workers Builds），
+# 统一按 LF 存盘，避免 Windows 上 autocrlf 把每次 diff 都搅成行尾噪音。
+* text=auto eol=lf
+
+# 二进制资源别当文本处理
+*.png binary
+*.jpg binary
+*.woff2 binary
