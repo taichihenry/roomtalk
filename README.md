@@ -86,6 +86,47 @@ export http_proxy=http://127.0.0.1:<当前端口> https_proxy=http://127.0.0.1:<
 ⚠ 代理会**间歇性抖**（`timed out` / `CONNECT tunnel failed, response 502`），
 **循环重试 2~3 次必过**，不用改配置。
 
+### 推送到 GitHub 即自动上线
+
+仓库：**https://github.com/taichihenry/roomtalk**（public，`main`）。
+Cloudflare 侧用 **Workers Builds** 的 Git 集成监听它，push 到 `main` 就自动构建 + 部署。
+
+构建配置（控制台：Workers & Pages → roomtalk → Settings → Builds → Connect）：
+
+| 设置项 | 值 | 为什么这么填 |
+|---|---|---|
+| Git 分支 | `main` | |
+| 构建命令 | `npm ci` | 按 lock 装上锁定版本的 wrangler，别让 CI 每次去抓最新版 |
+| 部署命令 | `npx wrangler deploy` | 默认值，不用改 |
+| 根目录 | `cloudflare` | ⚠ 见下 |
+
+⚠ **根目录必须填 `cloudflare`，不能留空。** 本仓库是前后端同仓，`wrangler.toml`
+在 `cloudflare/` 下；留空的话 wrangler 在仓库根找不到配置，会触发它的「自动配置」
+流程并给你开一个 PR —— 那不是我们要的。填了 `cloudflare` 之后，配置里的
+`[assets] directory = "../public"` 从该目录解析，正好指到仓库里的 `public/`。
+
+⚠ **Durable Object 的 Worker 不生成预览 URL**（Cloudflare 明确说明）。
+所以非生产分支的构建只有校验价值，没有可点的预览地址。不在意的话可以在设置里
+只保留生产分支，省构建时长。
+
+⚠ **接上 Git 集成后不要再手动 `wrangler deploy`。** 手动部署本身能成功，
+但下一次 push 触发的构建会把版本覆盖回去，容易误判成"我改的东西没上去"。
+紧急绕过 CI 时手动部署仍然可用，只是记得随后补一次 push 让两端对齐。
+
+> 依赖 lock 里的下载地址已统一为官方 `registry.npmjs.org`（不用 `npmmirror`），
+> 避免海外构建环境去拉国内镜像。
+
+**这条链路是验证过的**，不是照文档抄的：把仓库克隆到空目录，模拟 CI 做
+`npm ci` → `wrangler deploy --dry-run`，产物 **13.80 KiB / gzip 5.16 KiB**
+与线上一致，`../public` 正确读到 4 个文件。CI 与本地是同一套路径解析，
+这一步过了就不会卡在构建上。
+
+> Cloudflare 的 Git 集成用的是「Cloudflare Workers and Pages」这个 GitHub App。
+> 本账号此前接过 Pages 项目（`cftest`），**App 安装已存在**，
+> 但如果 `roomtalk` 没出现在仓库下拉列表里，去
+> GitHub → Settings → Applications → Cloudflare Workers and Pages → Configure →
+> Repository access，把这个仓库勾上即可。
+
 ---
 
 ## 五、免费额度够用吗
