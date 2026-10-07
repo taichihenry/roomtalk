@@ -16,6 +16,10 @@
   # 一年内强制 HTTPS。故意**不写 includeSubDomains**：一旦写死，
   # 以后若某个子域只想跑 http 就再也降不回来了，而收益几乎为零
   # （本站在 Cloudflare 上本来就只出口 https）。
+  #
+  # ⚠ 注意 HSTS 只是**第二道**防线，管不了"第一次"：规范要求浏览器
+  #   **忽略 http 响应里的 HSTS**，所以用户第一次用 http 打开时它不生效。
+  #   第一道防线是 Worker 里的 http → https 301（见 src/index.js）。
   Strict-Transport-Security: max-age=31536000
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer

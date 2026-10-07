@@ -109,6 +109,9 @@ cd cloudflare && npx wrangler dev
 # 只测 DO 的信令逻辑，秒级返回，不用起服务
 node cloudflare/test/do-sim.js
 
+# 只测 Worker 入口的「协议 + 域名归一」，也不用起服务
+node cloudflare/test/redirect.js
+
 # 端到端测（需要上一步的 wrangler dev 在跑）
 node test/e2e.mjs
 
@@ -403,6 +406,13 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 - 国际化域名有坑：`new URL().hostname` 返回 punycode 还是 Unicode 属于实现细节，
   所以 `.xn--fiqz9s` 和 `.中國` **两种写法都要判**，只判一种会静默不跳转。
 - 绑自定义域名时，DNS 面板提示"缺少 A / CNAME / MX"对 Worker 站点是**误报，一律忽略**。
+- **强制 https 的判别信号不能用 `cf-connecting-ip`**，也不能用 `url.hostname` / `Host` 头 ——
+  `wrangler dev` 会把请求**伪装成生产域名**（routes 绑了哪个就用哪个），实测本地拿到的是
+  `http://8.xn--fiqs8s/healthz`、`Host: 8.xn--fiqs8s`，**端口还被抹掉**；
+  同时它会把 `cf-connecting-ip` 设成 `127.0.0.1`。
+  于是「跳 https」的规则会把**本地开发和 e2e 全部 301 走**（本地地址 https 根本连不上）。
+  可靠信号是只有边缘才注入的 `cf-ray` / `cf-visitor` / `x-forwarded-proto` ——
+  本地实测这三个全是 null。见第十一节。
 
 ### Durable Object
 
@@ -489,11 +499,13 @@ __rt.__dropSocket()       // 模拟"连接已死"，验证重连
 每次动完前端或 DO，按这个顺序过一遍 —— 全是**能跑出结果**的，不是"看着没问题"。
 
 ```bash
-# 1. 语法（三个文件）
-node --check public/app.js && node --check cloudflare/src/room.js && node --check test/e2e.mjs
+# 1. 语法（四个文件）
+node --check public/app.js && node --check cloudflare/src/room.js \
+  && node --check cloudflare/src/index.js && node --check test/e2e.mjs
 
-# 2. DO 离线逻辑（不需要 wrangler，秒级出结果）
+# 2. 离线逻辑（都不需要 wrangler，秒级出结果）
 node cloudflare/test/do-sim.js        # 72 项，失败必须是 0
+node cloudflare/test/redirect.js      # 19 项，失败必须是 0（http→https 与域名归一）
 
 # 3. 双真浏览器端到端
 cd cloudflare
@@ -541,3 +553,62 @@ gh api repos/taichihenry/roomtalk/commits/<sha>/check-runs \
 
 看到 `Workers Builds: roomtalk → completed/success` 才算上线。然后到 `https://8.中国`
 真机点一遍：口令进房 → 双端接通 → 发消息 → 按住说话 → 发文件 → 互相看得见视频。
+
+---
+
+## 十一、为什么"必须 https"，以及怎么让手机不用手改地址
+
+### 结论：http 下这个站点**完全不能用**，不是"凑合能用"
+
+代码里有两处硬依赖，都**只在安全上下文**（https 或 localhost）才存在：
+
+| 用在哪 | API | 非安全上下文下的表现 |
+|---|---|---|
+| 口令派生房间号 | `crypto.subtle` | `undefined`，`deriveRoomId()` 直接抛错 |
+| 麦克风 / 摄像头 / 录音 | `navigator.mediaDevices` | `undefined`，语音视频通话全废 |
+
+`public/app.js` 里有一道显式守卫（`onSubmitPassphrase` 开头）：非安全上下文直接提示
+「当前地址不是安全上下文，浏览器不支持加密与音视频。请用 https:// 打开。」
+所以**没有"退化成纯文字聊天"这条路** —— 连房间都进不去。
+
+### 手机为什么默认走 http，桌面为什么不会
+
+- **桌面**浏览器的地址栏有 HTTPS-First 行为：输入裸域名先试 https，通了就留在 https，
+  用户根本看不到 http。
+- 很多**手机**浏览器仍沿用「补全成 `http://` 再发请求」的老路子，第一条请求就是明文 http。
+- **HSTS 救不了这一条**：规范要求浏览器**忽略 http 响应里的 `Strict-Transport-Security`**
+  （Cloudflare 即使在 http 响应上带了那个头也没用）。HSTS 只能管"来过一次 https 之后"，
+  管不了"第一次"。
+
+### 修法：服务端在 http 上 301 到 https
+
+`cloudflare/src/index.js` 的 `fetch()` 最前面做**协议 + 域名一次性归一**：只要求自边缘
+且协议是 http，就 `301` 到 `https://简体裸域`。必须是 **301**（不是 302）—— 浏览器会把它
+记下来，下次连试都不试 http。一次跳到位（https + 规范域名），不会出现两跳。
+
+### ⚠ 判别"是不是在边缘"的坑（血泪）
+
+不能靠 `url.hostname`，也不能靠 `cf-connecting-ip`：
+
+- `wrangler dev` 会把请求**伪装成生产域名**（`wrangler.toml` 的 routes 绑了 `8.xn--fiqs8s`）。
+  本地实测 `request.url` = `http://8.xn--fiqs8s/healthz`、`Host: 8.xn--fiqs8s`，**端口被抹掉**。
+- 而且它会把 `cf-connecting-ip` 设成 `127.0.0.1`。
+
+第一版就是栽在这上面：本地请求被当成"线上 http"，全部 301 到 `https://8.xn--fiqs8s`，
+本地开发与 e2e 直接跑不起来。可靠信号只有**边缘才注入**的三个头 ——
+`cf-ray` / `cf-visitor` / `x-forwarded-proto`（本地实测全为 null）。
+**`cf-connecting-ip` 绝不能进这个判断。**
+
+### 缺口与兜底
+
+`run_worker_first = ["/", "/index.html"]`，所以这条规则覆盖的是**页面请求**
+（用户在地址栏敲的那个就是）。静态资源本身直连 Assets、不走 Worker —— 但页面一旦被
+跳到 https，它带出来的子资源自然也是 https，实际不会漏。
+
+要在**边缘把所有路径（含静态资源）都兜住**，可在 Cloudflare 控制台里打开每个 zone 的
+**SSL/TLS → Edge Certificates → Always Use HTTPS**。那是边缘动作，在 Worker 之前执行、
+不用改代码 —— 本 Worker 里的 301 就是它的"版本化保险"：哪天开关被关掉，代码这层仍然生效。
+
+> 官方 API 也能改：`PATCH /zones/{id}/settings/always_use_https`，但需要带
+> `zone_settings:edit` 的令牌。wrangler 那份 OAuth 凭据权限不够，直连会报
+> `10000 Authentication error` —— 别在这上面浪费时间，去控制台点两下更快。
