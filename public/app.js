@@ -59,6 +59,30 @@ const MAX_PENDING = 200;
 const MAX_MESSAGES = 800;
 
 /*
+ * 文件 / 语音传输的参数。
+ *
+ * chat 这条 DataChannel 是 ordered: true（可靠 + 有序），所以分片天然按到达顺序
+ * 拼得回去，不用自己做序号重排。但**背压必须自己做**：连着 dc.send 几十 MB 会瞬间
+ * 把 bufferedAmount 顶爆然后抛错。所以切小片、盯着 bufferedAmount 走。
+ */
+/*
+ * 分片取 64KB。
+ *
+ * 浏览器 SCTP 的单条消息上限普遍在 256KB 以上，64KB 远在安全区内；而相比
+ * 16KB 的旧值，100MB 文件的 send 次数从 6400 次降到 1600 次 —— 每次 send 都有
+ * 固定开销（跨进程投递 + 背压判断），片切得太碎会让大文件传起来明显发闷。
+ * 上限仍是 1MB 缓冲，所以「一次顶爆 bufferedAmount」的风险不变。
+ */
+const XFER_CHUNK = 64 * 1024;
+const XFER_HIGH = 1_000_000;        // 缓冲 > 1MB 就暂停，等降到 XFER_LOW 再继续
+const XFER_LOW = 256 * 1024;
+const XFER_MAX = 100 * 1024 * 1024; // 单文件上限 100MB；再大浏览器内存就吃不消了
+const VOICE_MAX_MS = 60_000;        // 单条语音最长 60 秒（和微信一个量级）
+
+/** 相邻消息间隔超过这么久，就插一条居中的时间分隔（微信的做法）。 */
+const TIME_GAP_MS = 5 * 60_000;
+
+/*
  * 画质档位 —— 用户自己选，通话中随时可换。
  *
  * 每一档同时管两件事，缺一个都会「不流畅」：
@@ -284,6 +308,24 @@ const S = {
   retryTimer: null,
   leaving: false,
   started: false,
+
+  /* ---- 通话 / 播放 ---- */
+  audioBlocked: false, // 浏览器拦住了自动播放（表现为「听不到对方」）
+  ringKind: null,      // 正在响的来电类型：'audio' | 'video' | null
+  ringTimer: null,
+
+  /* ---- 语音消息 ---- */
+  recorder: null,      // 正在进行的 MediaRecorder
+  recChunks: [],
+  recStartedAt: 0,
+  recTimer: null,      // 到点自动停
+  recTimer2: null,     // 界面上的计时刷新
+  voiceMode: false,    // 输入栏是否处于「按住说话」模式
+
+  /* ---- 文件 / 语音传输 ---- */
+  rx: null,            // 正在接收的传输 { id, kind, name, mime, size, dur, chunks, got, el }
+  rxCount: 0,          // 累计收到的文件/语音条数（排障与测试用）
+  txCount: 0,          // 累计发出的文件/语音条数
 };
 
 /* ============================== 状态显示 ============================== */
@@ -297,8 +339,47 @@ function appendToLog(el) {
   const log = $('log');
   log.appendChild(el);
   // 长时间通话时限制 DOM 数量：没人会往上翻几百条，多留只是白占内存、拖慢渲染
-  while (log.children.length > MAX_MESSAGES) log.removeChild(log.firstElementChild);
+  while (log.children.length > MAX_MESSAGES) {
+    const old = log.firstElementChild;
+    // 淘汰语音条时先把播放停掉：从 DOM 里摘掉并不会让 <audio> 停止发声，
+    // 正在播的那条会变成「看不见却在响」
+    const audio = old.querySelector && old.querySelector('audio');
+    if (audio && !audio.paused) { try { audio.pause(); } catch { /* noop */ } }
+    // 语音/文件气泡里挂着 blob: URL，撤掉 DOM 的同时必须 revoke，
+    // 否则那几十 MB 的 Blob 会被一直引用着不放
+    const a = old.querySelector && old.querySelector('audio, a[download]');
+    const url = a && (a.src || a.href);
+    if (url && url.startsWith('blob:')) { try { URL.revokeObjectURL(url); } catch { /* noop */ } }
+    log.removeChild(old);
+  }
   scrollLog();
+}
+
+/*
+ * 时间分隔（微信那条居中的小灰条）。
+ *
+ * 只在「和上一条消息隔得够久」时才插 —— 每句都插一条时间等于没插，
+ * 反而把对话切碎。
+ */
+let lastMsgAt = 0;
+
+function timeLabel(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return hm;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+}
+
+function maybeTimeSeparator() {
+  const now = Date.now();
+  if (now - lastMsgAt < TIME_GAP_MS) return;
+  const el = document.createElement('div');
+  el.className = 'time';
+  el.textContent = timeLabel(now);
+  appendToLog(el);
+  lastMsgAt = now;
 }
 
 function notice(text) {
@@ -308,11 +389,158 @@ function notice(text) {
   appendToLog(el);
 }
 
+/** 文本气泡。带 .text 类，便于排障钩子只挑出文本消息。 */
 function addMessage(text, who) {
+  maybeTimeSeparator();
   const el = document.createElement('div');
-  el.className = 'msg ' + who;
+  el.className = 'msg text ' + who;
   el.textContent = text;          // textContent，天然免疫 XSS
   appendToLog(el);
+  lastMsgAt = Date.now();
+}
+
+/* ---------------- 体量 / 时长格式化 ---------------- */
+
+function fmtBytes(n) {
+  if (!n && n !== 0) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10 * 1024 ? 1 : 0) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function fmtDur(ms) {
+  const s = Math.max(1, Math.round(ms / 1000));
+  const m = Math.floor(s / 60);
+  return m ? `${m}′${String(s % 60).padStart(2, '0')}″` : `${s}″`;
+}
+
+/* ---------------- 语音 / 文件气泡 ---------------- */
+
+/**
+ * 语音消息气泡：一个播放按钮 + 时长，点一下播放。
+ *
+ * 音频本身是走 DataChannel 端到端过来的（Blob），存在内存里、不落盘 ——
+ * 刷新页面就没了。这符合「消息不存储」的产品边界。
+ */
+function addVoice(blob, who, dur) {
+  maybeTimeSeparator();
+  const el = document.createElement('div');
+  el.className = 'msg voice ' + who;
+
+  const wave = document.createElement('span');
+  wave.className = 'voice-wave';
+
+  const durEl = document.createElement('span');
+  durEl.className = 'voice-dur';
+  durEl.textContent = fmtDur(dur || 0);
+
+  const audio = document.createElement('audio');
+  const url = URL.createObjectURL(blob);
+  audio.src = url;
+  audio.preload = 'metadata';
+  audio.hidden = true;
+
+  el.append(wave, durEl, audio);
+  el.title = '点击播放';
+  el.addEventListener('click', () => {
+    if (audio.paused) {
+      audio.currentTime = 0;
+      audio.play().then(() => { el.classList.add('playing'); })
+        .catch(() => toast('播放失败'));
+    } else {
+      audio.pause();
+      el.classList.remove('playing');
+    }
+  });
+  audio.addEventListener('ended', () => {
+    el.classList.remove('playing');
+    audio.currentTime = 0;
+  });
+
+  appendToLog(el);
+  lastMsgAt = Date.now();
+  return el;
+}
+
+/** 文件消息气泡：图标 + 文件名 + 体积，点一下另存。 */
+function addFile(blob, name, who) {
+  maybeTimeSeparator();
+  const el = document.createElement('div');
+  el.className = 'msg file ' + who;
+
+  const ico = document.createElement('span');
+  ico.className = 'file-ico';
+  ico.textContent = fileIcon(name);
+
+  const meta = document.createElement('span');
+  meta.className = 'file-meta';
+  const nm = document.createElement('span');
+  nm.className = 'file-name';
+  nm.textContent = name || '文件';
+  const sz = document.createElement('span');
+  sz.className = 'file-size';
+  sz.textContent = fmtBytes(blob.size);
+  meta.append(nm, sz);
+
+  // 一律用 <a download> 让人自己决定要不要存 —— 「不存储」是这个产品的底线，
+  // 所以不做「自动打开」这种喧宾夺主的事。
+  const link = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = name || 'file';
+  link.target = '_blank';
+  link.rel = 'noopener';
+  link.title = '点击保存';
+  link.append(ico, meta);
+
+  el.appendChild(link);
+  appendToLog(el);
+  lastMsgAt = Date.now();
+  return el;
+}
+
+function fileIcon(name) {
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'heic'].includes(ext)) return '🖼';
+  if (['mp4', 'mov', 'mkv', 'webm', 'avi'].includes(ext)) return '🎬';
+  if (['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac'].includes(ext)) return '🎵';
+  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '🗜';
+  if (['pdf'].includes(ext)) return '📕';
+  if (['doc', 'docx'].includes(ext)) return '📘';
+  if (['xls', 'xlsx', 'csv'].includes(ext)) return '📗';
+  if (['ppt', 'pptx'].includes(ext)) return '📙';
+  if (['txt', 'md', 'json', 'js', 'ts', 'html', 'css', 'py', 'java', 'go', 'rs'].includes(ext)) return '📄';
+  return '📎';
+}
+
+/** 传输进度气泡：返回一个可更新百分比的小组件。 */
+function addProgress(who, label) {
+  maybeTimeSeparator();
+  const el = document.createElement('div');
+  el.className = 'msg progress ' + who;
+
+  const txt = document.createElement('span');
+  txt.className = 'progress-pct';
+  txt.textContent = label;
+
+  const bar = document.createElement('span');
+  bar.className = 'progress-bar';
+  const fill = document.createElement('i');
+  bar.appendChild(fill);
+
+  el.append(txt, bar);
+  appendToLog(el);
+  return {
+    el,
+    set(pct) {
+      fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      txt.textContent = Math.round(pct) + '%';
+    },
+    done() {
+      el.remove();
+    },
+  };
 }
 
 /*
@@ -605,6 +833,7 @@ function handlePeerLeft() {
   clearTimeout(S.peerLeftTimer);
   S.peerLeftTimer = setTimeout(() => {
     teardownPeer();
+    dismissRing();
     S.remotePeerId = null;
     S.peerName = '';
     syncMeta();
@@ -629,6 +858,9 @@ function teardownPeer() {
   }
   S.remoteStream = null;
   S.peerDeviceId = null;
+  // 通道没了，正在传的东西不可能再传完 —— 状态机要清掉，否则下一段二进制
+  // 会被错拼进上一条没收完的文件里
+  if (S.rx) { if (S.rx.progress) S.rx.progress.done(); S.rx = null; }
   // ⚠ 这里**不**清 S.peerName：teardownPeer 管的是「WebRTC 连接」，
   //   不是「对面是谁」。而且 preparePeer() 内部就会调它 —— 清掉的话，
   //   刚在 peer-joined 里拿到的设备名会被自己立刻抹掉。
@@ -693,9 +925,26 @@ function buildPeerConnection(amCaller) {
       S.remoteStream.addTrack(ev.track);
       rv.srcObject = S.remoteStream;
     }
-    rv.play().catch(() => { /* iOS 可能需要用户手势，静默忽略 */ });
+    // 一定要走 ensureRemotePlayback：静默 catch 会把「自动播放被拦」
+    // 变成用户眼里的「对方没开麦」
+    ensureRemotePlayback();
     if (ev.track.kind === 'video') {
-      ev.track.addEventListener('ended', () => { S.remoteHasVideo = false; syncStage(); });
+      ev.track.addEventListener('ended', () => {
+        // 对端的视频轨真的断了（摄像头被别的程序抢走、或对面直接关了摄像头）。
+        // 不能立刻改状态：重新协商时旧轨也会 ended，紧接着就来新轨，
+        // 马上置 false 会让画面闪一下。等一拍再确认还有没有活着的视频轨。
+        setTimeout(() => {
+          const rv2 = $('remote-video');
+          const live = !!(rv2.srcObject && rv2.srcObject.getVideoTracks
+            && rv2.srcObject.getVideoTracks().some((t) => t.readyState === 'live'));
+          // 只有「之前确实在显示画面」才提示一句，避免重协商时误报
+          if (!live && S.remoteMedia.video) {
+            S.remoteMedia.video = false;
+            notice('对方的摄像头已关闭');
+            syncStage();
+          }
+        }, 400);
+      });
     }
     syncStage();
   };
@@ -882,6 +1131,8 @@ async function applySignal(payload) {
 
 function bindDataChannel(dc) {
   S.dc = dc;
+  // 二进制分片按 ArrayBuffer 收，省掉一次 Blob→ArrayBuffer 的转换
+  dc.binaryType = 'arraybuffer';
 
   dc.onopen = () => {
     $('btn-send').disabled = false;
@@ -896,6 +1147,17 @@ function bindDataChannel(dc) {
   dc.onclose = () => { $('btn-send').disabled = true; };
 
   dc.onmessage = (ev) => {
+    // 裸二进制 = 文件 / 语音的分片，按「当前正在收的那一条」累加
+    if (ev.data instanceof ArrayBuffer) {
+      const rx = S.rx;
+      if (!rx) return;
+      rx.chunks.push(ev.data);
+      rx.got += ev.data.byteLength;
+      if (rx.progress && rx.size) rx.progress.set((rx.got / rx.size) * 100);
+      if (rx.got >= rx.size) finishRx();
+      return;
+    }
+
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === 'msg') {
@@ -915,6 +1177,12 @@ function bindDataChannel(dc) {
       syncStage();
     } else if (m.t === 'id') {
       onPeerIdentity(String(m.id || ''));
+    } else if (m.t === 'ring') {
+      onRing(m);
+    } else if (m.t === 'ring-answer') {
+      onRingAnswer(m);
+    } else if (m.t === 'xfer') {
+      onXferCtl(m);
     }
   };
 }
@@ -1053,66 +1321,451 @@ function sendText(text) {
 }
 
 function pushMediaState() {
-  if (S.dc && S.dc.readyState === 'open') {
-    try { S.dc.send(JSON.stringify({ t: 'media', media: S.media, quality: currentQuality() })); } catch { /* noop */ }
+  sendCtl({ t: 'media', media: S.media, quality: currentQuality() });
+}
+
+/* ============================== 语音消息 ============================== */
+
+/**
+ * 挑一个当前浏览器支持的录音格式。
+ *
+ * 没有统一答案：Chrome/Android 给 webm/opus，Safari 只给 mp4/aac。
+ * 所以按优先级探一遍，都不支持就交给浏览器自选（传给构造函数 undefined）。
+ */
+function pickAudioMime() {
+  if (!window.MediaRecorder) return '';
+  const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  for (const c of cands) {
+    try { if (MediaRecorder.isTypeSupported(c)) return c; } catch { /* 继续试 */ }
+  }
+  return '';
+}
+
+let recEl = null;
+
+function showRecHud() {
+  if (recEl) recEl.remove();
+  recEl = document.createElement('div');
+  recEl.className = 'rec-hud';
+
+  const dot = document.createElement('span');
+  dot.className = 'rec-dot';
+
+  const time = document.createElement('span');
+  time.className = 'rec-time';
+  time.textContent = '0:00';
+
+  const hint = document.createElement('span');
+  hint.className = 'rec-hint';
+  hint.textContent = '松手发送';
+
+  recEl.append(dot, time, hint);
+  document.body.appendChild(recEl);
+
+  const tick = () => {
+    if (!recEl) return;
+    const s = Math.floor((Date.now() - S.recStartedAt) / 1000);
+    const left = Math.max(0, Math.ceil((VOICE_MAX_MS - (Date.now() - S.recStartedAt)) / 1000));
+    time.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+      + (left <= 10 ? ` · 还剩 ${left}s` : '');
+  };
+  tick();
+  clearInterval(S.recTimer2);
+  S.recTimer2 = setInterval(tick, 250);
+}
+
+/**
+ * 开始录音（按住说话）。
+ *
+ * 用 pointerdown/pointerup 而不是 click：微信那种「按住录、松手发」必须同时知道
+ * 按下和抬起两个时刻。pointer 事件一套代码同时覆盖鼠标、触摸、手写笔。
+ */
+async function startRecord() {
+  if (S.recorder) return;
+  if (!connected()) { toast('还没和对方接通'); return; }
+  if (!window.MediaRecorder) { toast('这台设备的浏览器不支持录音'); return; }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch { toast('无法使用麦克风'); return; }
+
+  const mime = pickAudioMime();
+  let rec;
+  try {
+    rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  } catch {
+    try { rec = new MediaRecorder(stream); } catch { toast('这台设备不支持录音'); stream.getTracks().forEach((t) => t.stop()); return; }
+  }
+
+  S.recChunks = [];
+  S.recStartedAt = Date.now();
+  S.recorder = rec;
+  rec._cancelled = false;
+
+  rec.ondataavailable = (e) => { if (e.data && e.data.size) S.recChunks.push(e.data); };
+
+  rec.onstop = async () => {
+    const dur = Date.now() - S.recStartedAt;
+    for (const t of stream.getTracks()) { try { t.stop(); } catch { /* noop */ } }
+    clearInterval(S.recTimer2); S.recTimer2 = null;
+    S.recorder = null;
+    if (recEl) { recEl.remove(); recEl = null; }
+
+    const blob = new Blob(S.recChunks, { type: rec.mimeType || 'audio/webm' });
+    const cancelled = rec._cancelled;
+    S.recChunks = [];
+
+    if (cancelled || dur < 500 || blob.size < 600) {
+      if (!cancelled) toast('说话时间太短，已取消');
+      return;
+    }
+    const capped = Math.min(dur, VOICE_MAX_MS);
+    const el = addVoice(blob, 'me', capped);
+    if (await sendXfer('voice', blob, { mime: blob.type, dur: capped })) S.txCount++;
+    else { el.classList.add('failed'); toast('这条语音没发出去'); }
+  };
+
+  rec.start();
+  showRecHud();
+  // 到点自动停，免得一直占着麦克风
+  S.recTimer = setTimeout(() => stopRecord(), VOICE_MAX_MS);
+}
+
+function stopRecord(cancel) {
+  clearTimeout(S.recTimer);
+  S.recTimer = null;
+  const rec = S.recorder;
+  if (!rec) return;
+  if (cancel) rec._cancelled = true;
+  try { rec.stop(); } catch { /* 已经开始停了 */ }
+}
+
+/* ============================== 文件 / 语音传输 ============================== */
+
+/**
+ * 沿 DataChannel 发一个 Blob（分片 + 背压）。
+ *
+ * 协议是三段式的，靠「控制消息 + 裸二进制」混跑：
+ *   {t:'xfer', phase:'begin', ...元信息}  →  若干 ArrayBuffer 分片  →  {phase:'end'}
+ * chat 通道是 ordered:true，二进制必然落在 begin 和 end 之间，所以接收端
+ * 用一个「当前正在收的传输」状态机就够了，不需要序号。
+ *
+ * ⚠ 背压是必须的：DataChannel 的缓冲没有上限保护，一次 dc.send 几十 MB
+ *   会瞬间把 bufferedAmount 顶爆并抛错。所以盯着 bufferedAmount 走。
+ */
+async function sendXfer(kind, blob, meta) {
+  const dc = S.dc;
+  if (!dc || dc.readyState !== 'open') return false;
+
+  const id = crypto.randomUUID();
+  const begin = {
+    t: 'xfer', phase: 'begin', id, kind,
+    name: meta.name || '', mime: meta.mime || blob.type || '',
+    size: blob.size, dur: meta.dur || 0,
+  };
+  try { dc.send(JSON.stringify(begin)); } catch { return false; }
+
+  // 小东西（几 KB 的文字文件、几秒的语音）眨眼就发完了，给它挂个进度条
+  // 只会闪一下，反而显得卡。超过 256KB 才显示进度。
+  const showProgress = blob.size > 256 * 1024;
+  const progress = showProgress ? addProgress('me', kind === 'voice' ? '发送语音…' : '发送中…') : null;
+  dc.bufferedAmountLowThreshold = XFER_LOW;
+
+  let sent = 0;
+  try {
+    while (sent < blob.size) {
+      if (dc.readyState !== 'open') throw new Error('channel closed');
+      if (dc.bufferedAmount > XFER_HIGH) await waitDrain(dc);
+      const buf = await blob.slice(sent, sent + XFER_CHUNK).arrayBuffer();
+      if (!buf.byteLength) break;
+      dc.send(buf);
+      sent += buf.byteLength;
+      if (progress && blob.size) progress.set((sent / blob.size) * 100);
+    }
+    dc.send(JSON.stringify({ t: 'xfer', phase: 'end', id }));
+  } catch (e) {
+    console.warn('传输中断', e);
+    if (progress) progress.done();
+    toast('传输中断了');
+    return false;
+  }
+  if (progress) progress.done();
+  return true;
+}
+
+/** 等 bufferedAmount 降到低水位。带 3 秒兜底，避免事件万一不来就永久卡住。 */
+function waitDrain(dc) {
+  return new Promise((resolve) => {
+    const done = () => {
+      dc.removeEventListener('bufferedamountlow', done);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, 3000);
+    dc.addEventListener('bufferedamountlow', done);
+  });
+}
+
+/** 收到传输控制消息。 */
+function onXferCtl(m) {
+  if (m.phase === 'begin') {
+    if (m.size > XFER_MAX) {
+      toast(`对方要发的东西太大了（${fmtBytes(m.size)}），超过 100MB 上限`);
+      sendCtl({ t: 'xfer', phase: 'abort', id: m.id });
+      return;
+    }
+    S.rx = {
+      id: m.id, kind: m.kind, name: m.name || '', mime: m.mime || '',
+      size: m.size, dur: m.dur || 0, chunks: [], got: 0,
+      progress: (m.kind === 'file' && m.size > 256 * 1024) ? addProgress('them', '接收中…') : null,
+    };
+  } else if (m.phase === 'end') {
+    finishRx();
+  } else if (m.phase === 'abort') {
+    if (S.rx) { if (S.rx.progress) S.rx.progress.done(); S.rx = null; }
+  }
+}
+
+/** 收完了：拼成 Blob 并落成一条气泡。 */
+function finishRx() {
+  const rx = S.rx;
+  if (!rx) return;
+  S.rx = null;
+  if (rx.progress) rx.progress.done();
+  const blob = new Blob(rx.chunks, { type: rx.mime || 'application/octet-stream' });
+  rx.chunks = [];
+  if (rx.kind === 'voice') addVoice(blob, 'them', rx.dur);
+  else addFile(blob, rx.name || '文件', 'them');
+  S.rxCount++;
+}
+
+/* ---------------------------- 语音模式 / 发文件 ---------------------------- */
+
+function setVoiceMode(on) {
+  S.voiceMode = on;
+  $('btn-voice').classList.toggle('on', on);
+  $('btn-voice').setAttribute('aria-pressed', String(on));
+  $('btn-voice').title = on ? '切换到键盘' : '切换到语音';
+  $('text').hidden = on;
+  $('hold-talk').hidden = !on;
+  $('btn-send').hidden = on;
+  if (!on) $('text').focus();
+}
+
+async function sendFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  if (!connected()) { toast('还没和对方接通，请稍候'); return; }
+  for (const f of files) {
+    if (f.size > XFER_MAX) { toast(`「${f.name}」有 ${fmtBytes(f.size)}，超过 100MB 上限`); continue; }
+    if (await sendXfer('file', f, { name: f.name, mime: f.type })) {
+      S.txCount++;
+      addFile(f, f.name, 'me');
+    } else break;
   }
 }
 
 /* ============================== 音视频 ============================== */
 
-async function toggleMic() {
-  if (!S.micTrack) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      S.micTrack = stream.getAudioTracks()[0];
-      ensureLocalStream().addTrack(S.micTrack);
-      if (S.pc) S.pc.addTrack(S.micTrack, S.localStream);   // addTrack 会触发重新协商
-    } catch (e) {
-      console.warn(e);
-      toast('无法使用麦克风，请检查浏览器权限');
-      return;
-    }
-  } else {
-    S.micTrack.enabled = !S.micTrack.enabled;
+function connected() { return !!(S.dc && S.dc.readyState === 'open'); }
+
+/** 给对端发一条走 DataChannel 的控制消息（端到端，服务器不经手）。 */
+function sendCtl(obj) {
+  if (!connected()) return false;
+  try { S.dc.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+
+/**
+ * 打开麦克风（幂等）。已经开过就直接置回 enabled，不再二次申请权限。
+ *
+ * 时间戳顺序很讲究：**先 addTrack，再置 S.media.audio**。
+ * addTrack 会触发 onnegotiationneeded → 发 offer，对方那边随即 ontrack；
+ * 如果标志位早于 offer 落地，对方可能先收到 media 状态、后收到轨道，中间那一下
+ * 会短暂显示「对方开着麦但听不到」—— 虽然只闪一下，但正好是用户会截图来问的那种。
+ */
+async function ensureMic() {
+  if (S.micTrack) {
+    S.micTrack.enabled = true;
+    S.media.audio = true;
+    syncMediaUI(); syncStage(); pushMediaState();
+    return true;
   }
+  try {
+    // 通话场景把三个处理都打开：不加回声消除，对方会听到自己的声音绕回来
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    S.micTrack = stream.getAudioTracks()[0];
+    ensureLocalStream().addTrack(S.micTrack);
+    if (S.pc) S.pc.addTrack(S.micTrack, S.localStream);
+  } catch (e) {
+    console.warn(e);
+    toast(e && e.name === 'NotAllowedError'
+      ? '麦克风被浏览器拦下了。点地址栏左边的权限图标允许后再试。'
+      : '无法使用麦克风，请检查设备与权限');
+    return false;
+  }
+  S.media.audio = true;
+  syncMediaUI(); syncStage(); pushMediaState();
+  return true;
+}
+
+/** 打开摄像头（幂等）。 */
+async function ensureCam() {
+  if (S.camTrack) {
+    S.camTrack.enabled = true;
+    S.media.video = true;
+    const lv = $('local-video');
+    lv.srcObject = S.localStream;
+    lv.play().catch(() => { /* noop */ });
+    syncMediaUI(); syncStage(); pushMediaState();
+    return true;
+  }
+  try {
+    // 采集端就采 720p：再往下的分辨率交给 scaleResolutionDownBy 在编码前压，
+    // 这样切档是瞬时的（不用重启摄像头），「清晰」档也不会被采集上限锁死。
+    // max 限死 30fps，避免高刷设备采到 60fps 白烧一倍编码。
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30, max: 30 },
+      },
+    });
+    S.camTrack = stream.getVideoTracks()[0];
+    ensureLocalStream().addTrack(S.camTrack);
+    if (S.pc) {
+      S.pc.addTrack(S.camTrack, S.localStream);
+      tuneVideoSender(S.pc);   // addTrack 之后补设一次码率上限
+    }
+    const lv = $('local-video');
+    lv.srcObject = S.localStream;
+    lv.play().catch(() => { /* noop */ });
+  } catch (e) {
+    console.warn(e);
+    toast(e && e.name === 'NotAllowedError'
+      ? '摄像头被浏览器拦下了。点地址栏左边的权限图标允许后再试。'
+      : '无法使用摄像头，请检查设备与权限');
+    return false;
+  }
+  S.media.video = true;
+  syncMediaUI(); syncStage(); pushMediaState();
+  return true;
+}
+
+async function toggleMic() {
+  if (!S.micTrack) { await ensureMic(); return; }
+  S.micTrack.enabled = !S.micTrack.enabled;
   S.media.audio = S.micTrack.enabled;
   pushMediaState();
   syncMediaUI();
+  syncStage();
 }
 
 async function toggleCam() {
-  if (!S.camTrack) {
-    try {
-      // 采集端就采 720p：再往下的分辨率交给 scaleResolutionDownBy 在编码前压，
-      // 这样切档是瞬时的（不用重启摄像头），「清晰」档也不会被采集上限锁死。
-      // max 限死 30fps，避免高刷设备采到 60fps 白烧一倍编码。
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30, max: 30 },
-        },
-      });
-      S.camTrack = stream.getVideoTracks()[0];
-      ensureLocalStream().addTrack(S.camTrack);
-      if (S.pc) {
-        S.pc.addTrack(S.camTrack, S.localStream);
-        tuneVideoSender(S.pc);   // addTrack 之后补设一次码率上限
-      }
-      $('local-video').srcObject = S.localStream;
-      $('local-video').play().catch(() => { /* noop */ });
-    } catch (e) {
-      console.warn(e);
-      toast('无法使用摄像头，请检查浏览器权限');
-      return;
-    }
-  } else {
-    S.camTrack.enabled = !S.camTrack.enabled;
-  }
+  if (!S.camTrack) { await ensureCam(); return; }
+  S.camTrack.enabled = !S.camTrack.enabled;
   S.media.video = S.camTrack.enabled;
   pushMediaState();
   syncMediaUI();
   syncStage();
+}
+
+/**
+ * 争取一次远端音频的播放。
+ *
+ * 这是「互相听不到对方声音」最常见的**真实**原因：浏览器的自动播放策略
+ * 会拦掉非用户手势触发的音频 —— 视频还在动、画面一切正常，就是没声音。
+ * 这时绝不能静默失败（原实现就是 `.catch(() => {})`），否则用户只会
+ * 归因成「对方没开麦」或者「这产品坏了」。被拦就把解锁条亮出来。
+ */
+async function ensureRemotePlayback() {
+  const rv = $('remote-video');
+  try {
+    await rv.play();
+    setAudioBlocked(false);
+  } catch {
+    setAudioBlocked(true);
+  }
+}
+
+function setAudioBlocked(on) {
+  S.audioBlocked = on;
+  const b = $('audio-unlock');
+  if (b) b.hidden = !on;
+}
+
+/* ---------------------------- 发起 / 接听通话 ---------------------------- */
+
+/**
+ * 发起一次通话。
+ *
+ * 为什么是「呼叫 → 对方接听」而不是我按一下两边一起开麦：
+ *   · **开麦必须由使用者自己点。** 浏览器不允许无用户手势就采集麦克风，
+ *     getUserMedia 会直接被拒 —— 技术上替不了。
+ *   · 这也是隐私底线：谁也不能替对面打开话筒。
+ * 所以这里做两件事：我自己立刻开麦/开镜头（这是我的手势，合法）；
+ * 给对方发一条 ring，他点头之后他那边的麦克风才开。
+ *
+ * 顺便解掉一个隐蔽的坑：对方点「接听」这个手势，同时解锁了他浏览器里
+ * 远端音频的自动播放 —— 否则他会遇到「接了但听不到」。
+ */
+async function startCall(kind) {
+  if (!connected()) { toast('还没和对方接通，请稍候'); return; }
+  const okMic = await ensureMic();
+  if (!okMic) return;
+  if (kind === 'video') await ensureCam();
+  sendCtl({ t: 'ring', kind, name: S.myName || '' });
+  notice(kind === 'video' ? '已发起视频通话，等对方接听' : '已发起语音通话，等对方接听');
+}
+
+/** 收到对方的呼叫请求 → 亮出来电浮层。 */
+function onRing(m) {
+  const kind = m.kind === 'video' ? 'video' : 'audio';
+  S.ringKind = kind;
+  $('ring-avatar').textContent = kind === 'video' ? '📹' : '📞';
+  $('ring-title').textContent = `对方想和你${kind === 'video' ? '视频' : '语音'}通话`;
+  $('ring-sub').textContent = (m.name ? `对方设备：${m.name}\n` : '')
+    + '接听后才会打开你的麦克风';
+  $('ring').hidden = false;
+  clearTimeout(S.ringTimer);
+  S.ringTimer = setTimeout(() => {
+    dismissRing();
+    notice('对方发起过通话，你没接到');
+  }, 30_000);
+}
+
+function dismissRing() {
+  clearTimeout(S.ringTimer);
+  S.ringTimer = null;
+  S.ringKind = null;
+  $('ring').hidden = true;
+}
+
+async function acceptRing() {
+  const kind = S.ringKind;
+  dismissRing();
+  const ok = await ensureMic();       // ← 这次点击就是「用户手势」，顺带解锁远端音频播放
+  if (!ok) { sendCtl({ t: 'ring-answer', kind, accept: false }); return; }
+  if (kind === 'video') await ensureCam();
+  await ensureRemotePlayback();
+  sendCtl({ t: 'ring-answer', kind, accept: true });
+  notice('已接听');
+}
+
+function declineRing() {
+  const kind = S.ringKind;
+  dismissRing();
+  sendCtl({ t: 'ring-answer', kind, accept: false });
+  notice('已拒绝这次通话');
+}
+
+function onRingAnswer(m) {
+  if (m.accept) { notice('对方已接听'); toast('已接通'); }
+  else { notice('对方拒绝了通话请求'); toast('对方拒绝了这次通话'); }
 }
 
 function ensureLocalStream() {
@@ -1130,6 +1783,8 @@ function stopLocalMedia() {
   S.media = { audio: false, video: false };
   const lv = $('local-video');
   if (lv.srcObject) lv.srcObject = null;
+  setAudioBlocked(false);
+  dismissRing();
 }
 
 /* ============================== 界面同步 ============================== */
@@ -1146,9 +1801,19 @@ function syncMediaUI() {
   cam.setAttribute('aria-pressed', String(S.media.video));
   cam.title = S.media.video ? '关闭摄像头' : '打开摄像头';
 
-  // 用 title 顺带把对端状态挂在按钮上，不占界面空间
+  // 把对端状态挂到按钮的 tooltip 上，不占界面空间
   mic.dataset.peer = S.remoteMedia.audio ? 'on' : 'off';
   cam.dataset.peer = S.remoteMedia.video ? 'on' : 'off';
+  if (connected()) {
+    mic.title += S.remoteMedia.audio ? '（对方麦克风开着）' : '（对方还没开麦）';
+    cam.title += S.remoteMedia.video ? '（对方摄像头开着）' : '（对方还没开摄像头）';
+  }
+
+  // 输入栏的两个通话入口：通话中点亮，表示「这路已经通了」
+  const callA = $('btn-call-audio');
+  const callV = $('btn-call-video');
+  if (callA) callA.classList.toggle('on', S.media.audio && S.remoteMedia.audio);
+  if (callV) callV.classList.toggle('on', S.media.video && S.remoteMedia.video);
 }
 
 function syncStage() {
@@ -1159,19 +1824,88 @@ function syncStage() {
 
   if (!anyVideo && !anyAudio) {
     stage.hidden = true;
+    stage.style.height = '';      // 收起时把内联高度清掉，别把上次的算出来
     return;
   }
   stage.hidden = false;
 
-  // 本地小窗只在真开了摄像头时显示，否则会是一个黑框
+  // 自己那格：没开摄像头就显示一块占位，而不是留个黑框
   lv.hidden = !S.media.video;
+  const localEmpty = $('stage-empty-local');
+  if (localEmpty) localEmpty.hidden = S.media.video;
 
+  // 对方那格
   const empty = $('stage-empty');
   const remoteVideoOn = S.remoteMedia.video;
   empty.hidden = remoteVideoOn;
   if (!remoteVideoOn) {
-    empty.textContent = anyAudio && !anyVideo ? '语音通话中' : '对方还没打开摄像头';
+    empty.textContent = anyAudio && !anyVideo
+      ? '语音通话中'
+      : (S.remoteMedia.audio ? '对方开着麦克风，没开摄像头' : '对方还没打开摄像头');
   }
+
+  // 角标带上设备名 + 麦克风状态。
+  // 「听不到对方」有一半情况其实是对面没开麦 —— 与其让用户猜，不如直接写在画面角上。
+  const tagR = $('tag-remote');
+  const tagL = $('tag-local');
+  if (tagR) {
+    const parts = ['对方'];
+    if (S.peerName) parts.push(S.peerName);
+    if (connected() && !S.remoteMedia.audio) parts.push('未开麦');
+    tagR.textContent = parts.join(' · ');
+  }
+  if (tagL) {
+    const parts = ['我'];
+    if (S.myName) parts.push(S.myName);
+    if (!S.media.audio) parts.push('已静音');
+    tagL.textContent = parts.join(' · ');
+  }
+
+  fitStage();
+}
+
+/**
+ * 让视频区的高度**贴着实际画面比例**走。
+ *
+ * CSS 里给的是「按摄像头大概长宽比倒推」的经验值（竖屏 3:4 / 横屏 16:9），
+ * 但真实摄像头什么比例都有 —— 4:3、16:9、甚至 9:16 竖屏。
+ * 用 object-fit: contain 不裁切是对的，但如果格子比例和画面差太多，
+ * 就会留出很宽的黑边，看着像「没铺满」。
+ *
+ * 所以拿到真实分辨率后重算一次格子高度：两格宽度固定是 (舞台宽 - 间隙) / 2，
+ * 高度 = 格宽 / 画面比例。这样 contain 几乎不留黑边，同时**两块格子依然等大**。
+ *
+ * 优先用对方画面的比例 —— 屏幕上主要看的是对方。
+ * 上限压到视口高度的 62%，免得一块竖屏画面把聊天区整个吃掉。
+ */
+function fitStage() {
+  const stage = $('stage');
+  if (!stage || stage.hidden) return;
+
+  const ratioOf = (v) => (v && v.videoWidth && v.videoHeight ? v.videoWidth / v.videoHeight : 0);
+  // 对方还没出画面时，用自己摄像头的比例兜底（通常两台设备的摄像头是同类）
+  const ratio = ratioOf($('remote-video')) || ratioOf($('local-video'));
+  if (!ratio) { stage.style.height = ''; return; }   // 回落到 CSS 的默认高度
+
+  const paneW = Math.max(0, (stage.clientWidth - 2) / 2);
+  if (!paneW) return;
+  const h = Math.round(Math.max(110, Math.min(paneW / ratio, window.innerHeight * 0.62)));
+  // 读 clientWidth 会强制一次同步布局，所以只在高度真的变了时才写回去 ——
+  // 反复写同一个值等于白白触发重排
+  const next = h + 'px';
+  if (stage.style.height !== next) stage.style.height = next;
+}
+
+/*
+ * resize 是**高频**事件：拖动窗口时每个像素都会触发一次，手机地址栏收放同理。
+ * 而 fitStage 要读 clientWidth（强制同步布局）再写 height（触发重排），
+ * 直接把它挂在 resize 上就是一路卡着主线程抖。合并到下一帧，一帧最多算一次。
+ */
+let fitQueued = false;
+function queueFitStage() {
+  if (fitQueued) return;
+  fitQueued = true;
+  requestAnimationFrame(() => { fitQueued = false; fitStage(); });
 }
 
 /* ============================== 排障钩子 ============================== */
@@ -1257,8 +1991,22 @@ window.__rt = {
 
   get status() { return $('status').textContent; },
   get messages() {
-    return [...document.querySelectorAll('#log .msg')].map((e) => ({ who: e.classList.contains('me') ? 'me' : 'them', text: e.textContent }));
+    // 只挑文本气泡：语音/文件也是 .msg，但它们没有 text 语义，
+    // 混进来会把「聊了什么」这件事搅浑
+    return [...document.querySelectorAll('#log .msg.text')]
+      .map((e) => ({ who: e.classList.contains('me') ? 'me' : 'them', text: e.textContent }));
   },
+  get voiceCount() { return document.querySelectorAll('#log .msg.voice').length; },
+  get fileCount() { return document.querySelectorAll('#log .msg.file').length; },
+  get txCount() { return S.txCount; },
+  get rxCount() { return S.rxCount; },
+  get voiceMode() { return S.voiceMode; },
+  get audioBlocked() { return S.audioBlocked; },
+  get audioUnlockShown() { return !$('audio-unlock').hidden; },
+  get ringShown() { return !$('ring').hidden; },
+  get stageShown() { return !$('stage').hidden; },
+  get localTag() { return $('tag-local').textContent; },
+  get remoteTag() { return $('tag-remote').textContent; },
 
   /** 仅供自动化测试：模拟「浏览器判定这条连接已经死了」 */
   __dropSocket() { handleSocketLost(); },
@@ -1316,8 +2064,87 @@ function boot() {
     else toast('还没和对方接通，请稍候');
   });
 
+  /* ---- 输入栏：语音 / 附件 / 发起通话 ---- */
+
+  $('btn-voice').addEventListener('click', () => setVoiceMode(!S.voiceMode));
+
+  // 按住说话：pointerdown 起录、pointerup 停。
+  // pointerup/pointercancel 挂在 window 而不是按钮上 —— 手指按住后划出按钮范围
+  // 再松开时，按钮收不到 pointerup，录音就会一直挂着。
+  const hold = $('hold-talk');
+  let holdWanted = false;   // 手指还按着吗
+
+  hold.addEventListener('pointerdown', async (ev) => {
+    ev.preventDefault();
+    holdWanted = true;
+    hold.classList.add('recording');
+    hold.textContent = '松开 发送';
+
+    await startRecord();     // 申请麦克风是异步的，这期间用户可能已经松手了
+
+    if (!S.recorder) {       // 起录失败（没权限 / 不支持）
+      holdWanted = false;
+      hold.classList.remove('recording');
+      hold.textContent = '按住 说话';
+      return;
+    }
+    // 松手发生在麦克风就绪之前 → 这条本来就没打算录，直接丢弃。
+    // 不处理的话，录音会一直挂到 60 秒上限才停，用户会觉得「按一下就开始偷录」。
+    if (!holdWanted) {
+      stopRecord(true);
+      hold.classList.remove('recording');
+      hold.textContent = '按住 说话';
+    }
+  });
+
+  const endHold = () => {
+    holdWanted = false;
+    if (!S.recorder) return;
+    hold.classList.remove('recording');
+    hold.textContent = '按住 说话';
+    stopRecord();
+  };
+  window.addEventListener('pointerup', endHold);
+  window.addEventListener('pointercancel', () => {
+    holdWanted = false;
+    if (!S.recorder) return;
+    hold.classList.remove('recording');
+    hold.textContent = '按住 说话';
+    stopRecord(true);
+  });
+
+  $('btn-attach').addEventListener('click', () => $('file-input').click());
+  $('file-input').addEventListener('change', (ev) => {
+    const files = [...ev.target.files];   // 先拷出来：清空 input 会让 FileList 一起失效
+    ev.target.value = '';
+    sendFiles(files);
+  });
+
+  $('btn-call-audio').addEventListener('click', () => startCall('audio'));
+  $('btn-call-video').addEventListener('click', () => startCall('video'));
+
+  /* ---- 来电浮层 ---- */
+  $('ring-accept').addEventListener('click', acceptRing);
+  $('ring-decline').addEventListener('click', declineRing);
+
+  /* ---- 远端声音解锁 ---- */
+  $('audio-unlock').addEventListener('click', async () => {
+    try { await $('remote-video').play(); setAudioBlocked(false); }
+    catch { toast('还是被拦住了：请检查系统音量 / 静音开关'); }
+  });
+
   $('btn-mic').addEventListener('click', toggleMic);
   $('btn-cam').addEventListener('click', toggleCam);
+
+  // 画面分辨率一出来（或旋转屏幕、改窗口大小）就重算视频区高度 —— 见 fitStage。
+  // 统一走 queueFitStage：这几个事件全是高频的，合并到帧上再算，别让布局抖成筛子。
+  for (const id of ['remote-video', 'local-video']) {
+    const v = $(id);
+    v.addEventListener('loadedmetadata', queueFitStage);
+    v.addEventListener('resize', queueFitStage);
+  }
+  window.addEventListener('resize', queueFitStage);
+  window.addEventListener('orientationchange', () => setTimeout(queueFitStage, 120));
 
   // 画质档位：存在本机，下次打开还是这个选择
   loadQuality();
@@ -1340,6 +2167,13 @@ function boot() {
     }
   });
 
+  // 任何一次点击都顺手争取一次播放权：用户点界面时就把可能被拦住的远端音频放出来，
+  // 免得他非要找到那条解锁提示才听得见。
+  document.addEventListener('pointerdown', () => {
+    if (!S.audioBlocked) return;
+    $('remote-video').play().then(() => setAudioBlocked(false)).catch(() => { /* noop */ });
+  }, { passive: true });
+
   // 刷新后自动回到同一间房：房间号存在 sessionStorage 里，
   // 关掉标签页就没了 —— 想「用完即走」的时候它不会留下任何东西。
   const saved = sessionStorage.getItem('rt.room');
@@ -1349,7 +2183,9 @@ function boot() {
     $('passphrase').focus();
   }
 
+  setVoiceMode(false);
   syncMediaUI();
+  syncStage();
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

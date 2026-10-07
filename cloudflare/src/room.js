@@ -390,7 +390,13 @@ export class SignalRoom {
     const a = ws.deserializeAttachment() || {};
     if (!(a.rooms || []).includes(roomId)) return;   // 本来就不在这间房，别广播
 
-    this._patch(ws, { rooms: a.rooms.filter((r) => r !== roomId) });
+    // roomHost 必须跟着 rooms 一起删。它俩是一对：只在「还在这间房里」时才有意义，
+    // 留着已退出房间的那条记录，只会让 attachment 随「换过多少间房」一路变大
+    // （同一条长连接反复换房是正常用法），最后还会撞上 attachment 的体积上限、
+    // 被 _patch 静默吞掉 —— 那连还留着的房间也会跟着丢房主记录。
+    const hosts = Object.assign({}, a.roomHost || {});
+    delete hosts[roomId];
+    this._patch(ws, { rooms: a.rooms.filter((r) => r !== roomId), roomHost: hosts });
 
     const rooms = this._roomsIndex();
     const room = rooms.get(roomId);

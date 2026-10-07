@@ -512,10 +512,115 @@ async function main() {
   await A.eval(setAutoKick(true));
   check('开关能再开回来（不是单向的）', await A.eval('__rt.autoKick') === true);
 
-  /* ---------------------------- 8. 房主先退，房间不关 ---------------------------- */
-  section('8. 房主先退出 → 房里的人接任房主 → 原房主回来是后进者');
+  /* ---------------------------- 8. 通话入口与音视频布局 ---------------------------- */
+  section('8. 发起通话 / 等分视频区 / 语音消息 / 发文件');
 
+  // --- 8a. 「发起视频通话」→ 对方接听 ---
+  // 开麦必须由使用者自己点（浏览器不允许无手势采集），所以设计成呼叫-接听，
+  // 而不是「我一按两边一起开」。这里验证这条链路真的走得通。
+  check('输入栏里有发起语音/视频通话的入口',
+    await A.eval('!!document.getElementById("btn-call-audio") && !!document.getElementById("btn-call-video")'));
+
+  await A.click('btn-call-video');
+  await waitUntil(async () => await B.eval('__rt.ringShown'), 'B 弹出通话请求', 12000)
+    .then(() => check('发起方一按，对方就收到通话请求', true))
+    .catch(async () => check('发起方一按，对方就收到通话请求', false, await B.eval('__rt.ringShown')));
+  check('来电浮层说明了是哪一种通话',
+    /视频/.test(await B.eval('document.getElementById("ring-title").textContent')),
+    await B.eval('document.getElementById("ring-title").textContent'));
+
+  await B.click('ring-accept');
+  check('接听后浮层收起', await B.eval('__rt.ringShown') === false);
+  // ⚠ 接听是异步的（要等 getUserMedia），click() 一返回就断言会拿到旧值 —— 必须等
+  check('接听这个动作本身就打开了对方的麦克风（不依赖再去点别处）',
+    await waitUntil(async () => (await B.eval('__rt.media.audio')) === true, 'B 麦克风就绪', 20000)
+      .then(() => true).catch(() => false), await B.eval('__rt.media'));
+  check('视频通话接听后对方摄像头也开了',
+    await waitUntil(async () => (await B.eval('__rt.media.video')) === true, 'B 摄像头就绪', 25000)
+      .then(() => true).catch(() => false), await B.eval('__rt.media'));
+  check('发起方收到了对方的视频轨道（双向视频）', await waitUntil(
+    async () => (await A.eval('__rt.remoteVideoTracks')) > 0, 'A 收到 B 的视频', 25000,
+  ).then(() => true).catch(() => false));
+  check('远端声音没有被自动播放策略挡住', await B.eval('__rt.audioBlocked') === false);
+
+  // --- 8b. 视频区：两块窗口必须一样大，且不裁切 ---
+  const panes = await A.eval(`(() => [...document.querySelectorAll('#stage .pane')]
+    .map((p) => { const r = p.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; }))()`);
+  check('视频区是两块窗口（不是「对方铺满 + 自己小窗」）', panes.length === 2, panes);
+  check('两块窗口尺寸完全一致（显示比例不再一边大一边小）',
+    panes[0].w === panes[1].w && panes[0].h === panes[1].h, panes);
+  check('双方视频都用 object-fit: contain（完整显示，不裁切、不放大）',
+    await A.eval('getComputedStyle(document.getElementById("remote-video")).objectFit') === 'contain'
+    && await A.eval('getComputedStyle(document.getElementById("local-video")).objectFit') === 'contain');
+  check('视频窗口角标带上了设备名（视频里也能核对对面是谁）',
+    /对方/.test(await A.eval('__rt.remoteTag')) && /我/.test(await A.eval('__rt.localTag')),
+    { remote: await A.eval('__rt.remoteTag'), local: await A.eval('__rt.localTag') });
+
+  // --- 8c. 语音消息（按住说话）---
+  const voiceBefore = await B.eval('__rt.voiceCount');
+  await A.click('btn-voice');
+  check('输入栏能切到「按住说话」模式', await A.eval('__rt.voiceMode') === true);
+  check('切过去后文字输入框让位给了说话条',
+    await A.eval('document.getElementById("text").hidden && !document.getElementById("hold-talk").hidden'));
+
+  await A.eval(`(() => {
+    const h = document.getElementById('hold-talk');
+    h.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await sleep(1500);   // 录 1.5 秒（低于 0.5 秒会被当成误触丢弃）
+  await A.eval(`window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })), true`);
+
+  check('按住录、松手发：这条语音落到了自己的消息里',
+    await waitUntil(async () => (await A.eval('__rt.voiceCount')) > 0, 'A 出现语音气泡', 15000)
+      .then(() => true).catch(() => false));
+  check('语音消息通过 P2P 送达了对方（服务器不经手）',
+    await waitUntil(async () => (await B.eval('__rt.voiceCount')) > voiceBefore, 'B 收到语音', 30000)
+      .then(() => true).catch(async () => check('B 收到语音', false, await B.eval('__rt.voiceCount'))));
+
+  await A.click('btn-voice');
+  check('能切回键盘模式', await A.eval('__rt.voiceMode') === false);
+
+  // --- 8d. 发文件（分片 + 背压）---
+  // 300KB 按 64KB 切片 = 5 片，正好把「分片重组」这条路径走通
+  const fileBefore = await B.eval('__rt.fileCount');
+  await A.eval(`(() => {
+    const input = document.getElementById('file-input');
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(300 * 1024).fill(65)], 'e2e-测试.txt', { type: 'text/plain' }));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+
+  check('发出去的文件立刻出现在自己这一侧',
+    await waitUntil(async () => (await A.eval('__rt.fileCount')) > 0, 'A 出现文件气泡', 20000)
+      .then(() => true).catch(() => false));
+  check('文件通过 P2P 送达，且在对方那边拼回了完整内容',
+    await waitUntil(async () => (await B.eval('__rt.fileCount')) > fileBefore, 'B 收到文件', 40000)
+      .then(() => true).catch(async () => check('B 收到文件', false, await B.eval('__rt.fileCount'))));
+  check('收到的文件保留了原文件名与体积',
+    await B.eval(`(() => {
+      const n = document.querySelector('#log .msg.file .file-name');
+      const s = document.querySelector('#log .msg.file .file-size');
+      return n ? (n.textContent + '|' + (s ? s.textContent : '')) : '';
+    })()`) === 'e2e-测试.txt|300 KB',
+    await B.eval(`(() => {
+      const n = document.querySelector('#log .msg.file .file-name');
+      const s = document.querySelector('#log .msg.file .file-size');
+      return n ? (n.textContent + '|' + (s ? s.textContent : '')) : '';
+    })()`));
+
+  /* ---------------------------- 9. 房主先退，房间不关 ---------------------------- */
+  section('9. 房主先退出 → 房里的人接任房主 → 原房主回来是后进者');
+
+  // 退出前先确认此刻确实开着摄像头 —— 否则下面那条「松开设备」的断言等于没测
+  const camWasOn = await A.eval('__rt.media.video');
   await A.eval('document.getElementById("btn-hangup").click(), true');
+  check('退出房间时真正松开摄像头与麦克风（设备指示灯必须灭）',
+    camWasOn === true
+    && await A.eval('__rt.media.video === false && __rt.media.audio === false'),
+    { camWasOn });
   await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
   check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);
   check('新房主拿到了「请出房间」的权限', await B.eval('__rt.kickBtnShown') === true);

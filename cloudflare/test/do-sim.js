@@ -448,6 +448,9 @@ async function main() {
     await send(room, a.ws, { type: 'leave', room: ROOM_A });
     check('房主退出的那一刻 B 就接任（不用等下一个新人进来）',
       b.ws.sent.some((m) => m.type === 'host' && m.host === true), types(b.ws.sent));
+    check('离开时连自己的房主记录一起清掉（attachment 不随换房一路变大）',
+      !(a.ws.deserializeAttachment().roomHost || {})[ROOM_A],
+      a.ws.deserializeAttachment().roomHost);
     check('房里还有人 → 房间不关闭（口令不算腾空）',
       (room._roomsIndex().get(ROOM_A) || new Set()).size === 1);
 
@@ -513,6 +516,30 @@ async function main() {
       x.ws.sent.some((m) => m.type === 'host' && m.host === true), types(x.ws.sent));
     check('补出来的房主不是刚进来的那个人',
       y.ws.sent.find((m) => m.type === 'room-joined')?.host === false);
+  }
+
+  /* ---------------------------- 13. 换房不涨内存 ---------------------------- */
+  section('13. 反复换房时 attachment 不增长（长连接的内存卫生）');
+  {
+    // 同一条长连接反复进出不同房间是正常用法（用户换了口令）。
+    // attachment 上跟房间有关的东西（rooms / roomHost）必须**有进有出**，
+    // 否则一条开了一整天的连接会拖着几十条已退出房间的记录，
+    // 最后撞上 attachment 体积上限、被 _patch 静默吞掉。
+    const ctx = new FakeCtx();
+    const room = new SignalRoom(ctx, {});
+    room.ctx = ctx;
+
+    const a = await open(room);
+    const rids = [...Array(6).keys()].map((i) => i.toString(16).padStart(32, '0'));
+    for (const rid of rids) {
+      await send(room, a.ws, { type: 'join', room: rid, clientId: 'ca' });
+      await send(room, a.ws, { type: 'leave', room: rid });
+    }
+    const at = a.ws.deserializeAttachment() || {};
+    check('rooms 不随换房次数累积', (at.rooms || []).length === 0, at.rooms);
+    check('roomHost 不随换房次数累积', Object.keys(at.roomHost || {}).length === 0, at.roomHost);
+    check('换过的房间全部真的腾空了',
+      rids.every((rid) => !room._roomsIndex().get(rid)));
   }
 
   /* ---------------------------- 结果 ---------------------------- */

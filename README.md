@@ -282,7 +282,72 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 
 ---
 
-## 六、画质档位：让用户自己选
+## 六、通话与消息：为什么必须双方各自点一下
+
+### 「互相听不到」的三种真凶，以及各自的解法
+
+用户反馈「有时候互相听不到对方声音」。逐个查过，其实是三件事被混在一起：
+
+| 真凶 | 表现 | 解法 |
+|---|---|---|
+| **对面没开麦** | 我说话他听得到，他说话我听不到 | 视频/语音窗口角标直接写「对方 · Windows 电脑 · **未开麦**」，不用猜 |
+| **浏览器拦了自动播放** | 视频在动、画面正常，就是没声音 | `video.play()` 失败时不再静默 `catch`，而是弹出「🔊 点这里打开」解锁条；界面任意一次点击也会顺手重试 |
+| **得双方各自开麦** | 以为「进房就该自动通」 | 这是**设计如此**，见下 |
+
+### 为什么要「呼叫 → 接听」
+
+**开麦必须由使用者自己点，这是浏览器强制的，不是我们偷懒**：
+`getUserMedia({audio:true})` 在没有用户手势时会被直接拒绝。
+
+所以输入栏上的 📞 / 📹 做的是两件事：
+
+1. **我自己这边立刻开麦 / 开镜头**（这是我的手势，合法）；
+2. 给对方发一条 `ring`，对方点「接听」之后他那边的麦克风才会开。
+
+顺带解掉一个隐蔽的坑：**对方点「接听」这个手势，同时解锁了他浏览器里远端音频的自动播放**。
+不做这一步，就会出现「接了但听不到」。
+
+> 顶栏那两个 🎙 / 📷 是**通话中调麦调镜头**用的（含挂断），
+> 输入栏的 📞 / 📹 才是**发起通话**。两处不是重复。
+
+### 消息：文字 / 语音 / 文件
+
+三种都走同一条 DataChannel（端到端，服务器不经手）：
+
+| 类型 | 怎么发 | 说明 |
+|---|---|---|
+| 文字 | 输入框回车 | |
+| 语音 | 切到 🎙 模式，**按住说话、松手发送** | MediaRecorder 录制，最长 60 秒；短于 0.5 秒算误触，自动丢弃 |
+| 文件 | 📎 选文件 | 单文件上限 100MB，多选可一次发多个 |
+
+分片协议是三段式的：`{xfer,begin}` → 若干 `ArrayBuffer` 分片 → `{xfer,end}`。
+`chat` 通道是 `ordered: true`，二进制必然落在 begin 和 end 之间，
+所以接收端只要一个「当前正在收的传输」状态机就够了，**不需要序号**。
+
+⚠ **背压必须自己做**：DataChannel 的缓冲没有上限保护，连着 `dc.send` 几十 MB
+会瞬间把 `bufferedAmount` 顶爆然后抛错。所以按 16KB 切片，
+`bufferedAmount > 1MB` 就等 `bufferedamountlow` 再继续。
+
+> 收到的语音 / 文件只存在内存里（`Blob`），**不落盘、刷新即失** ——
+> 这和「消息不存储」是同一条边界。文件一律给一个 `<a download>`，
+> 由用户自己决定要不要存，不做「自动打开」这种喧宾夺主的事。
+
+### 视频区：为什么是等分 + contain
+
+原来是「对方铺满整块舞台 + 自己缩在右下角 26% 的小窗」，且舞台是固定宽高比、
+视频用 `object-fit: cover` —— 结果就是**对方的竖屏画面被硬裁一大块**，
+看起来很怪（用户原话：「显示不全，像被局部放大」）。
+
+现在：
+
+- **两块窗口等分**（`grid-template-columns: 1fr 1fr`），横屏左右排、竖屏上下排，尺寸完全一致；
+- 每格 **`object-fit: contain`** —— 宁可留黑边也不裁切。视频通话里「看得见整个人」
+  比「填满每一像素」重要得多；
+- 自己那格水平镜像（像照镜子），角标写「我 · 设备名」，对方那格写「对方 · 设备名 · 未开麦」。
+
+---
+
+## 七、画质档位：让用户自己选
 
 视频流量消耗的是**双方自己的手机流量**（720p 不限速约 1.4 GB/人/小时），
 所以要省流量得从编码参数下手。工具栏上有一个下拉框，通话中**随时可换**：
@@ -325,7 +390,7 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 
 ---
 
-## 七、踩过的坑（改代码前先读）
+## 八、踩过的坑（改代码前先读）
 
 ### 部署 / 配置
 
@@ -350,6 +415,10 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 - **`deserializeAttachment()` 要当深拷贝对待**。真实 DO 每次返回新对象；
   改了却不写回 `serializeAttachment`，线上会**静默丢状态**。离线测试的 shim 也必须深拷贝，
   否则浅拷贝的假 shim 永远测不出这个问题。
+- **attachment 上的字段必须"有进有出"**。`rooms` 和 `roomHost[房间号]` 是一对，
+  退出房间时两个都要删。只清 `rooms` 不清 `roomHost`，一条开了一整天的连接会拖着
+  几十条已退出房间的记录一路变大，最后撞上 attachment 体积上限 —— 那时 `_patch`
+  会静默吞掉异常，**连还留着的房间也一起丢房主记录**。
 
 ### 客户端
 
@@ -359,10 +428,30 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
   这是网络假死重连的自愈路径。
 - `--no-proxy-server` 会让本机这份 Chrome（153）**启动即退且不报错**，
   调试端口根本不监听。测试里不要加这个参数。
+- **`teardownPeer()` 里不能清 `S.peerName`**。它管的是「WebRTC 连接」而不是「对面是谁」，
+  而且 `preparePeer()` 内部就会调它 —— 清掉的话，刚在 `peer-joined` 拿到的设备名
+  会被自己立刻抹掉。对端真走了才清（`handlePeerLeft` / `kickPeer`）。
+- **别拿「状态文案含『已连接』」当重连成功的判据**。断线后状态栏**不会**被清空，
+  旧文案还挂在那儿，`waitUntil` 第一轮就命中，等于没等。
+  可靠判据是「`peerId` 变了 **且** `dcOpen === true`」。
+- **接听是异步的**（要等 `getUserMedia`）。`element.click()` 一返回就断言
+  `__rt.media.audio`，拿到的一定是旧值 —— 必须 `waitUntil`。
+- **按住说话要处理「松手早于麦克风就绪」**。`pointerdown` 里 `await getUserMedia`
+  期间用户可能已经抬手；不判断的话录音会一直挂到 60 秒上限，
+  用户会觉得「按一下就开始偷录」。（`holdWanted` 标记解决。）
+- **高频事件不要直接挂重活**。`resize` 每像素触发一次，而 `fitStage()` 要读
+  `clientWidth`（强制同步布局）再写 `height`（触发重排）—— 直接挂上去就是一路抖。
+  统一走 `queueFitStage()`，合并到帧上、一帧最多算一次。
+- **传输分片取 64KB，不是 16KB**。SCTP 单条消息上限普遍在 256KB 以上，64KB 很安全；
+  而 100MB 文件的 `send` 次数从 6400 降到 1600 —— 每次 `send` 都有固定开销，
+  片切得太碎会让大文件传起来发闷。
+- **改了 `app.js` / `app.css` 就顺手改 `index.html` 里的 `?v=`**。静态资源缓存 10 分钟，
+  不带版本号的话，上线瞬间会有用户拿到「新页面 + 旧脚本」。⚠ `preload` 的 `href`
+  必须与 `<script src>` 逐字一致（含 `?v=`），否则等于白下载两份。
 
 ---
 
-## 八、排障入口
+## 九、排障入口
 
 页面加载后，控制台里有一个只读诊断对象 `window.__rt`（**不暴露口令**）：
 
@@ -371,6 +460,13 @@ __rt.room                 // 房间号（口令的派生值）
 __rt.connectionState      // PC 连接状态
 __rt.media                // 本端 音/视频 开关
 __rt.remoteMedia          // 对端 音/视频 开关
+__rt.audioBlocked         // 远端声音是否被自动播放策略挡住了
+__rt.audioUnlockShown     // 解锁条是否正显示着
+__rt.ringShown            // 是否正在响来电
+__rt.voiceCount           // 聊天气泡里的语音条数
+__rt.fileCount            // 聊天气泡里的文件条数
+__rt.txCount / __rt.rxCount   // 累计发出 / 收到 的传输条数
+__rt.localTag / __rt.remoteTag // 视频窗口角标文案（含设备名与是否开麦）
 __rt.videoTuned           // 视频码率参数是否已生效
 __rt.quality              // 我当前选的画质档位
 __rt.remoteQuality        // 对方选的档位
@@ -385,3 +481,63 @@ __rt.__dropSocket()       // 模拟"连接已死"，验证重连
 - `cpu` —— 编码算力不够，**降码率没用**，得降分辨率或帧率
 
 没有这个字段，调码率全靠猜。
+
+---
+
+## 十、上线前检查清单
+
+每次动完前端或 DO，按这个顺序过一遍 —— 全是**能跑出结果**的，不是"看着没问题"。
+
+```bash
+# 1. 语法（三个文件）
+node --check public/app.js && node --check cloudflare/src/room.js && node --check test/e2e.mjs
+
+# 2. DO 离线逻辑（不需要 wrangler，秒级出结果）
+node cloudflare/test/do-sim.js        # 72 项，失败必须是 0
+
+# 3. 双真浏览器端到端
+cd cloudflare
+node node_modules/wrangler/bin/wrangler.js dev --port 8787   # 让它在一个终端里开着
+cd ..
+node test/e2e.mjs                     # 97 项，失败必须是 0
+```
+
+⚠ 跑 e2e 前先 `taskkill //F //IM chrome.exe //T`：残留的 Chrome 会占着调试端口 9222，
+报「Chrome 未能就绪」——和代码无关。跑完停 `wrangler dev` 要**杀父 node 进程**
+（`taskkill /T`），只杀占 8787 的 workerd 会被自动重启。
+
+### 轻（体积与首屏）
+
+| 指标 | 期望 | 怎么查 |
+|---|---|---|
+| app.js | ~28 KB（gzip） | `gzip -c public/app.js \| wc -c` |
+| app.css | ~6 KB（gzip） | 同上 |
+| 外部依赖 | **0**（无框架、无 CDN、无字体外链） | 通读 `index.html` 的 `<link>` / `<script>` |
+| 首屏请求 | 3 个：HTML + CSS，JS 由 preload 并行拉 | 见第九节 |
+
+### 稳（会不会越跑越糟）
+
+- 任何**只增不减**的结构都必须有闸门：`S.pending`（200 条 + 15s TTL）、
+  消息 DOM（800 条，淘汰时 `revokeObjectURL`）、DO 的限流表
+  （`webSocketClose` 里 `_rate.delete`）、attachment 的 `rooms` / `roomHost`。
+- 退出房间必须**真正松开设备**：`backToGate()` → `stopLocalMedia()`。
+  摄像头指示灯不灭不只是隐私问题，还会让用户以为"还在通话"。e2e 有这条断言。
+- 重连是双保险：`onclose` + pong 超时（8 秒），退避 15 秒封顶，
+  且**连上后 `S.retry` 必须归零** —— 否则抖动过一次之后，每次重连都要等满 15 秒。
+
+### 流畅（会不会卡）
+
+- 高频事件一律合并到帧：`resize` / `orientationchange` → `queueFitStage()`，
+  消息滚动 → `scrollLog()`。
+- 动画只用 `opacity` / `transform`（走合成层），全站没有 `transition: all`。
+- 长列表只做尾部插入 + 头部淘汰，不整表重排。
+
+### 部署后
+
+```bash
+gh api repos/taichihenry/roomtalk/commits/<sha>/check-runs \
+  --jq '.check_runs[] | "\(.name) → \(.status)/\(.conclusion)"'
+```
+
+看到 `Workers Builds: roomtalk → completed/success` 才算上线。然后到 `https://8.中国`
+真机点一遍：口令进房 → 双端接通 → 发消息 → 按住说话 → 发文件 → 互相看得见视频。

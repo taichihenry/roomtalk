@@ -9,9 +9,13 @@
 <meta name="description" content="和对方约定一串口令，输入即接通。文字、语音、视频点对点直达，服务器不经手、不存储。">
 <title>暗号 · 口令通话</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Cpath d='M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z' fill='%23fff' opacity='.92'/%3E%3Ccircle cx='43' cy='24' r='7' fill='none' stroke='%23fff' stroke-width='3.4'/%3E%3Cpath d='M43 31v6' stroke='%23fff' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="app.css">
-<!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求 -->
-<link rel="preload" href="app.js" as="script">
+<link rel="stylesheet" href="app.css?v=20261007">
+<!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求。
+     ⚠ preload 的 href 必须和下面 <script> 的 src **逐字一致（含 ?v=）**，
+       否则等于白下两份。
+     ⚠ 改了 app.js / app.css，就把这个 ?v= 一起改掉（随意换个值即可）：
+       URL 一变缓存立刻失效，用户永远不会拿到「新页面 + 旧脚本」的混搭。 -->
+<link rel="preload" href="app.js?v=20261007" as="script">
 </head>
 <body>
 
@@ -95,23 +99,63 @@
     </span>
   </div>
 
+  <!-- 视频舞台：两块窗口**等分**（横屏左右、竖屏上下），尺寸完全一致。
+       不要做成「对方铺满 + 自己小窗」—— 那会让两端显示比例差太多。 -->
   <div id="stage" class="stage" hidden>
-    <video id="remote-video" class="remote" autoplay playsinline></video>
-    <div id="stage-empty" class="stage-empty">对方还没打开摄像头</div>
-    <video id="local-video" class="local" autoplay playsinline muted></video>
+    <div class="pane">
+      <video id="remote-video" class="remote" autoplay playsinline></video>
+      <span class="pane-tag" id="tag-remote">对方</span>
+      <div id="stage-empty" class="stage-empty">对方还没打开摄像头</div>
+    </div>
+    <div class="pane">
+      <video id="local-video" class="local" autoplay playsinline muted></video>
+      <span class="pane-tag" id="tag-local">我</span>
+      <div id="stage-empty-local" class="stage-empty">摄像头未开</div>
+    </div>
+  </div>
+
+  <!-- 声音解锁兜底：浏览器（尤其 iOS）会拦掉「非用户手势触发」的音频播放。
+       被拦时视频照常、就是没声音 —— 用户只会觉得「听不到对方」。
+       所以给一条显眼的、点一下就好的出口，而不是静默失败。 -->
+  <button id="audio-unlock" class="audio-unlock" type="button" hidden>
+    🔊 浏览器挡住了对方的声音 —— 点这里打开
+  </button>
+
+  <!-- 来电浮层。口令房间里没有「拨号」概念，但「我要开麦」这件事
+       必须由对方**自己**点一下：既是隐私（不能替别人开麦），
+       也顺手解决了自动播放需要用户手势的问题。 -->
+  <div id="ring" class="ring" hidden>
+    <div class="ring-card">
+      <div class="ring-avatar" id="ring-avatar">📞</div>
+      <p class="ring-title" id="ring-title">对方想和你通话</p>
+      <p class="ring-sub" id="ring-sub">接听后才会打开你的麦克风</p>
+      <div class="ring-actions">
+        <button id="ring-decline" class="ring-btn ghost" type="button">拒绝</button>
+        <button id="ring-accept" class="ring-btn accept" type="button">接听</button>
+      </div>
+    </div>
   </div>
 
   <div id="log" class="log" role="log" aria-live="polite"></div>
 
+  <!-- 输入栏（参考微信的结构）：切换语音 / 附件 / 文字 / 发起通话。
+       通话入口放在这里而不是只藏在顶栏 —— 顶栏那两个是「通话中调麦调镜头」，
+       这里才是「发起」。 -->
   <form id="composer" class="composer" autocomplete="off">
+    <button id="btn-voice" class="cbtn" type="button" title="切换到语音" aria-label="切换到语音" aria-pressed="false">🎙</button>
+    <button id="btn-attach" class="cbtn" type="button" title="发送文件" aria-label="发送文件">📎</button>
     <input id="text" type="text" placeholder="输入消息…" autocomplete="off"
            maxlength="2000" enterkeyhint="send" aria-label="消息内容">
+    <button id="hold-talk" class="hold-talk" type="button" hidden>按住 说话</button>
+    <button id="btn-call-audio" class="cbtn call" type="button" title="发起语音通话" aria-label="发起语音通话">📞</button>
+    <button id="btn-call-video" class="cbtn call" type="button" title="发起视频通话" aria-label="发起视频通话">📹</button>
     <button type="submit" id="btn-send" class="primary" disabled>发送</button>
   </form>
+  <input id="file-input" type="file" multiple hidden>
 </main>
 
 <div id="toast" class="toast" hidden role="status"></div>
 
-<script src="app.js"></script>
+<script src="app.js?v=20261007"></script>
 </body>
 </html>
