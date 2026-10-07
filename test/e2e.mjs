@@ -266,6 +266,15 @@ async function main() {
     !!(await A.eval('__rt.peerDeviceId')) && !!(await B.eval('__rt.peerDeviceId')));
   check('两端设备标识不同', await A.eval('__rt.peerDeviceId') !== await B.eval('__rt.peerDeviceId'));
 
+  // 设备名条：每台设备进房时自动报上自己是什么设备，双方照着念一遍就能对上人
+  await waitUntil(async () => (await B.eval('__rt.metaOther')) !== '未进入', 'B 看到对方的设备名', 12000)
+    .then(() => check('对端的设备名会自动显示出来（口令之外多一道口头核对）', true))
+    .catch(async () => check('对端的设备名会自动显示出来', false, await B.eval('__rt.metaOther')));
+  check('本机设备名不是占位符', !['', '—'].includes(await A.eval('__rt.metaSelf')));
+  check('两端显示的是同一个设备名（同一台机器上的两个浏览器）',
+    await A.eval('__rt.metaOther') === await B.eval('__rt.metaSelf'),
+    { a见到的对方: await A.eval('__rt.metaOther'), b自己的: await B.eval('__rt.metaSelf') });
+
   /* ---------------------------- 2. 文字 ---------------------------- */
   section('2. 文字');
 
@@ -456,6 +465,79 @@ async function main() {
   const autoKicked = await waitUntil(async () => (await B.eval('__rt.kickedCount')) > kicked2, 'B 再次被自动请出', 25000)
     .then(() => true).catch(() => false);
   check('被请出过的设备再进来会被自动请走', autoKicked);
+
+  /* ---------------------------- 7. 误请之后的回头路 ---------------------------- */
+  section('7. 「自动请出」开关 —— 手滑误请之后必须有回头路');
+
+  /*
+   * ⚠ 不能拿「状态文案含『已连接』」当重连成功的判据：状态栏在断线后**不会**被清空，
+   *   旧文案还挂在那儿，waitUntil 第一轮就会立刻返回（等于没等）。
+   *   真正可靠的判据是两条：连接换了一条（peerId 每次建连都重新生成）+ 数据通道确实开着。
+   */
+  const waitReconnected = (page, beforePeerId, label) => waitUntil(async () =>
+    (await page.eval('__rt.peerId')) !== beforePeerId && (await page.eval('__rt.dcOpen')) === true,
+    label, 30000);
+
+  check('房主能看到「自动请出」开关', await A.eval('__rt.autokickShown') === true);
+  check('后进者看不到房主专属控件', await B.eval('__rt.autokickShown') === false);
+  check('黑名单里确实有 1 台设备', await A.eval('__rt.blockedCount') === 1);
+  check('房主能看到「解除拉黑」入口（名单非空）',
+    await A.eval('!document.getElementById("btn-unblock").hidden') === true);
+
+  // 关掉「自动请出」→ 被拉黑的人再进来不再被自动赶走。这正是「点错了」的补救。
+  const setAutoKick = (on) => `(() => {
+    const c = document.getElementById('autokick');
+    c.checked = ${on};
+    c.dispatchEvent(new Event('change', { bubbles: true }));
+    return c.checked;
+  })()`;
+  await A.eval(setAutoKick(false));
+  check('开关能关掉（偏好存在本机）', await A.eval('__rt.autoKick') === false);
+
+  const kicked3 = await B.eval('__rt.kickedCount');
+  const bPeerBefore = await B.eval('__rt.peerId');
+  await B.enter(PASSPHRASE);
+  await waitReconnected(B, bPeerBefore, 'B 重新接通');
+  check('关掉自动请出后，被拉黑的人能正常连上（不再被自动赶走）',
+    (await B.eval('__rt.kickedCount')) === kicked3);
+  check('房主侧看得到对方回来了（设备名条有内容）',
+    (await A.eval('__rt.peerName') || '').length > 0, await A.eval('__rt.metaOther'));
+
+  // 解除拉黑：把名单清空，彻底回到「没拉黑过」的状态
+  await A.click('btn-unblock');
+  check('解除拉黑后名单清空', await A.eval('__rt.blockedCount') === 0);
+  check('名单清空后「解除拉黑」入口自动收起',
+    await A.eval('!document.getElementById("btn-unblock").hidden') === false);
+
+  await A.eval(setAutoKick(true));
+  check('开关能再开回来（不是单向的）', await A.eval('__rt.autoKick') === true);
+
+  /* ---------------------------- 8. 房主先退，房间不关 ---------------------------- */
+  section('8. 房主先退出 → 房里的人接任房主 → 原房主回来是后进者');
+
+  await A.eval('document.getElementById("btn-hangup").click(), true');
+  await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
+  check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);
+  check('新房主拿到了「请出房间」的权限', await B.eval('__rt.kickBtnShown') === true);
+  check('房间没有关闭（口令仍被这一方占着）', await waitUntil(
+    async () => (await B.eval('__rt.status')).includes('等待'), 'B 回到等待状态', 12000,
+  ).then(() => true).catch(() => false), await B.eval('__rt.status'));
+
+  const aPeerBefore = await A.eval('__rt.peerId');
+  await A.enter(PASSPHRASE);
+  await waitReconnected(A, aPeerBefore, 'A 重新接通');
+  check('原房主再进来是后进者，自动失去请出权限',
+    await A.eval('__rt.isHost') === false, await A.eval('__rt.isHost'));
+  check('原房主连「请出房间」按钮都看不到', await A.eval('__rt.kickBtnShown') === false);
+  check('新房主依然持有权限', await B.eval('__rt.isHost') === true);
+
+  // 两个人都退出，房间（也就是这个口令的占用）才真正腾空
+  await B.eval('document.getElementById("btn-hangup").click(), true');
+  await A.eval('document.getElementById("btn-hangup").click(), true');
+  await sleep(800);
+  check('两人都退出后都回到了入口',
+    await A.eval('!document.getElementById("gate").hidden') === true &&
+    await B.eval('!document.getElementById("gate").hidden') === true);
 
   /* ---------------------------- 结果 ---------------------------- */
   console.log('\n' + '─'.repeat(56));

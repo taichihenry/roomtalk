@@ -101,15 +101,69 @@ function clientId() {
   return v;
 }
 
+/**
+ * 自动取一个「设备名」，进房时随 join 一起报给服务端，双方都能看到对方是什么设备。
+ *
+ * 用途只有一个：**帮双方确认对面坐的是不是自己人**。口令是共享秘密，
+ * 光看口令分不清进来的是 B 还是 C；但看到「对方 · Xiaomi 14」，双方就能
+ * 口头核对一句「你那边显示的是什么」—— 这是纯口令方案能拿到的、最便宜的一道确认。
+ *
+ * 拿不到精确型号不是问题：能区分「手机 / 电脑 + 品牌机型」就够用了。
+ * ⚠ 任何情况下都**不上报唯一标识**（那属于设备指纹，和这个产品「不留痕迹」冲突）——
+ *   这里只取厂商型号这类公开、可重复、不指向个人的信息。
+ */
 function guessDeviceName() {
   const ua = navigator.userAgent;
+
+  // Chromium 的 UA-CH：Android 上 model 就是真实机型（"Pixel 8"、"2201123C"…）
+  try {
+    const d = navigator.userAgentData;
+    if (d && d.platform) {
+      const p = d.platform;
+      const model = (d.model || '').trim();
+      if (p === 'Android') return model ? 'Android · ' + model : 'Android 手机';
+      if (p === 'iOS') return /iPad/i.test(ua) ? 'iPad' : 'iPhone';
+      if (p === 'Windows') return 'Windows 电脑';
+      if (p === 'macOS') return 'Mac';
+      if (p === 'Chrome OS' || p === 'Chromium OS') return 'Chromebook';
+      if (p === 'Linux') return 'Linux 电脑';
+    }
+  } catch { /* 老浏览器没有 UA-CH，落到下面的 UA 解析 */ }
+
   if (/iPhone/i.test(ua)) return 'iPhone';
   if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1)) return 'iPad';
-  if (/Android/i.test(ua)) return 'Android';
-  if (/Windows/i.test(ua)) return 'Windows';
+  if (/Android/i.test(ua)) {
+    // 安卓 UA 里机型夹在 "Android 13; Pixel 8)" 或 "Android 13; SM-G991B Build/…" 之间
+    const m = ua.match(/Android[^;)]*;\s*([^;)]+?)(?:\s+Build|\)|;)/);
+    return m && m[1].trim() ? 'Android · ' + m[1].trim() : 'Android 手机';
+  }
+  if (/Windows/i.test(ua)) return 'Windows 电脑';
+  if (/CrOS/i.test(ua)) return 'Chromebook';
   if (/Macintosh|Mac OS X/i.test(ua)) return 'Mac';
-  if (/Linux/i.test(ua)) return 'Linux';
+  if (/Linux/i.test(ua)) return 'Linux 电脑';
   return '未知设备';
+}
+
+/**
+ * 异步补一次「高熵」UA-CH，把 Android 的真实机型要出来。
+ *
+ * ⚠ 低熵的 `navigator.userAgentData.model` **恒为空字符串** —— 机型属于高熵字段，
+ *   必须显式调 `getHighEntropyValues(['model'])` 才会给。所以上面那份同步逻辑
+ *   在 Android 上只够得出「Android 手机」，这里再补一次：拿到就用，拿不到维持原样。
+ *
+ * 补到之后如果已经进房了，顺手 rename 一次，让对方那边的显示也跟着更新。
+ */
+async function refineDeviceName() {
+  try {
+    const d = navigator.userAgentData;
+    if (!d || typeof d.getHighEntropyValues !== 'function') return;
+    const h = await d.getHighEntropyValues(['model', 'platform']);
+    const model = String(h.model || '').trim();
+    if (!model) return;                                  // 桌面端本来就没有机型字段
+    S.myName = ((h.platform === 'Android' ? 'Android · ' : '') + model).slice(0, 24);
+    syncMeta();
+    if (S.started && S.ws && S.ws.readyState === 1) send({ type: 'rename', name: S.myName });
+  } catch { /* 老浏览器没有 UA-CH，保持同步那份结果 */ }
 }
 
 /* ============================== 身份 ============================== */
@@ -165,6 +219,30 @@ function addBlocked(room, id) {
     localStorage.setItem(blockKey(room), JSON.stringify(list.slice(-20)));
   }
 }
+function clearBlocked(room) {
+  try { localStorage.removeItem(blockKey(room)); } catch { /* noop */ }
+}
+
+/*
+ * 「自动请出」开关（只有房主用得上）。
+ *
+ * 背景是一个真实的翻车场景：房主手滑点错「请出房间」，对方就被记进黑名单，
+ * 之后再进来自动被请走 —— 于是**永远也等不到对方**，而且退出重进都没用
+ * （黑名单在 localStorage 里）。
+ *
+ * 所以把「自动 / 手动」交给房主自己定：
+ *   · 自动（默认）—— 黑名单设备一进来就请走。口令被陌生人猜中时这是防线。
+ *   · 手动        —— 只提示、不动手，由房主看着办。误请之后用它把人放回来。
+ * 是设备级的个人偏好，不按房间存。
+ */
+const AUTOKICK_KEY = 'rt.autokick';
+
+function loadAutoKick() {
+  try { return localStorage.getItem(AUTOKICK_KEY) !== '0'; } catch { return true; }
+}
+function saveAutoKick(on) {
+  try { localStorage.setItem(AUTOKICK_KEY, on ? '1' : '0'); } catch { /* noop */ }
+}
 
 /* ============================== 状态 ============================== */
 
@@ -185,6 +263,9 @@ const S = {
   ignoreOffer: false,
   settingAnswer: false,
   isHost: false,        // 我是不是房主（第一个进房的人）—— 只有房主能请人出去
+  autoKick: true,       // 房主专属：黑名单设备再进来时是否自动请走（见 AUTOKICK_KEY）
+  myName: '',           // 我这台设备的设备名（进房时上报给对端）
+  peerName: '',         // 对端的设备名
 
   localStream: null,   // 本地音视频源（跨 PC 重建复用）
   remoteStream: null,
@@ -298,10 +379,13 @@ function enterRoom(roomId) {
   S.room = roomId;
   S.started = true;
   S.leaving = false;
+  if (!S.myName) S.myName = guessDeviceName().slice(0, 24);
+  S.peerName = '';
   $('gate').hidden = true;
   $('room').hidden = false;
   $('log').innerHTML = '';
   setStatus('waiting', '正在连接…');
+  syncMeta();
   connect();
   $('text').focus();
 }
@@ -310,6 +394,7 @@ function backToGate() {
   S.leaving = true;
   S.started = false;
   S.isHost = false;
+  S.peerName = '';
   clearTimeout(S.retryTimer);
   clearTimeout(S.peerLeftTimer);
   stopPing();
@@ -350,7 +435,7 @@ function connect() {
     S.retry = 0;
     clearTimeout(S.pongTimer);
     setStatus('waiting', '正在加入房间…');
-    send({ type: 'join', room: S.room, clientId: clientId(), name: guessDeviceName() });
+    send({ type: 'join', room: S.room, clientId: clientId(), name: (S.myName || guessDeviceName()).slice(0, 24) });
   };
 
   ws.onmessage = (ev) => {
@@ -441,14 +526,15 @@ function handleServerMessage(m) {
       break;
 
     case 'room-joined':
-      // 房主身份由服务端判定（第一个进房的人）。只有房主能请人出去，
-      // 后进来的一方没有这个按钮，也没有这个权限。
+      // 房主身份由服务端判定：第一个进房的人是房主，只有他能请人出去。
+      // 「谁先退出谁让位」—— 所以这行也可能是 host=false。
       S.isHost = !!m.host;
       setStatus('waiting', '等待对方接入');
+      reflectHostUI();
       break;
 
     case 'host':
-      // 原房主离开、我接任 —— 这时才把「请出房间」的入口给我
+      // 原房主退出了，我接任 —— 这时才把「请出房间」的入口给我
       S.isHost = !!m.host;
       reflectHostUI();
       break;
@@ -461,6 +547,8 @@ function handleServerMessage(m) {
     case 'peers':
       // 房里已经有人 → 他是主叫方，我应答
       if (Array.isArray(m.peers) && m.peers.length) {
+        S.peerName = m.peers[0].name || '';
+        syncMeta();
         setStatus('waiting', '已找到对方，正在建立连接…');
         preparePeer(m.peers[0].id, false);
       }
@@ -469,6 +557,8 @@ function handleServerMessage(m) {
     case 'peer-joined':
       // 有人进来了 → 我主叫
       clearTimeout(S.peerLeftTimer);
+      S.peerName = m.peer.name || '';
+      syncMeta();
       setStatus('waiting', '已找到对方，正在建立连接…');
       preparePeer(m.peer.id, true);
       break;
@@ -490,6 +580,8 @@ function handleServerMessage(m) {
       break;
 
     case 'peer-renamed':
+      // 对端补报/改了自己的设备名（例如异步拿到真实机型之后再报一次）
+      if (m.peerId === S.remotePeerId) { S.peerName = m.name || ''; syncMeta(); }
       break;
 
     default:
@@ -514,6 +606,8 @@ function handlePeerLeft() {
   S.peerLeftTimer = setTimeout(() => {
     teardownPeer();
     S.remotePeerId = null;
+    S.peerName = '';
+    syncMeta();
     notice('对方已离开');
     setStatus('waiting', '等待对方接入');
   }, PEER_LEFT_GRACE);
@@ -535,6 +629,10 @@ function teardownPeer() {
   }
   S.remoteStream = null;
   S.peerDeviceId = null;
+  // ⚠ 这里**不**清 S.peerName：teardownPeer 管的是「WebRTC 连接」，
+  //   不是「对面是谁」。而且 preparePeer() 内部就会调它 —— 清掉的话，
+  //   刚在 peer-joined 里拿到的设备名会被自己立刻抹掉。
+  //   对端真的走了才清，那两处是 handlePeerLeft 和 kickPeer。
   S.ignoreOffer = false;
   S.makingOffer = false;
   S.settingAnswer = false;
@@ -835,15 +933,18 @@ function onPeerIdentity(id) {
   if (!id) return;
   S.peerDeviceId = id;
 
-  // 先前被我请出去过的设备又回来了 → 不建立通话，直接再请走。
-  // 但只有房主有这个权限：不是房主时请不动（服务端也会拒绝），
-  // 这时如实提示用户「你没法请走它，只能自己退出」，别给假承诺。
+  // 先前被我请出去过的设备又回来了。
+  // 拉黑名单是**房主**的名单，所以只有房主用得上它；不是房主时请不动
+  // （服务端也会拒绝），这时如实告诉用户「你没法请走它，只能自己退出」。
   if (getBlocked(S.room).includes(id)) {
-    if (S.isHost) {
+    if (!S.isHost) {
+      showTrust('warn', '⚠️ 对方是你之前请出过的设备，但你不是先进入房间的一方，无法请走它。你可以直接退出房间。');
+      $('trust-keep').hidden = true;      // 它在你的黑名单里，再给「记住这台」是自相矛盾的
+    } else if (S.autoKick) {
       kickPeer('对方是你之前请出过的设备，已再次请出');
     } else {
-      showTrust('warn', '⚠️ 对方是你之前请出过的设备，但你不是先进入房间的一方，无法请走它。你可以直接退出房间。');
-      // 这台设备正躺在你的黑名单里，再给「记住这台」是自相矛盾的
+      // 房主把「自动请出」关了 → 只提示，不动手，由他自己决定
+      showTrust('warn', '⚠️ 对方是你之前请出过的设备。你已经关掉了自动请出：要赶人请点「请出房间」，想放他进来就不用管。');
       $('trust-keep').hidden = true;
     }
     return;
@@ -865,31 +966,57 @@ function onPeerIdentity(id) {
 
 function showTrust(kind, text) {
   const bar = $('trust');
-  if (!text) { bar.hidden = true; return; }
-  bar.hidden = false;
-  bar.className = 'trust' + (kind ? ' ' + kind : '');
-  $('trust-text').textContent = text;
-  // 「记住这台」只在「设备变了」时有意义 —— 首次已经自动记住了
-  $('trust-keep').hidden = kind !== 'warn';
+  bar.hidden = !text;
+  if (text) {
+    bar.className = 'trust' + (kind ? ' ' + kind : '');
+    $('trust-text').textContent = text;
+    // 「记住这台」只在「设备变了」时有意义 —— 首次已经自动记住了
+    $('trust-keep').hidden = kind !== 'warn';
+  }
   reflectHostUI();
 }
 
 /**
- * 按「我是不是房主」决定「请出房间」按钮是否可见。
+ * 刷新设备名条：我是什么设备 / 对方是什么设备。
  *
- * 只有第一个进入房间的人（房主）能请人出去 —— 后进来的一方没有这个按钮。
- * 服务端也会做同样的校验，前端隐藏只是不让用户白点一下。
+ * 口令是共享秘密，光看口令分不清进来的是约好的那个人还是别人。
+ * 设备名做不到「认证」，但它给了一次**口头核对**的机会 ——
+ * 「你那边显示的是什么？」—— 这已经是纯口令方案能拿到的最便宜的一道确认。
  */
-function reflectHostUI() {
-  $('trust-kick').hidden = !S.isHost;
+function syncMeta() {
+  $('meta-self').textContent = S.myName || '—';
+  $('meta-other').textContent = S.peerName || '未进入';
+  reflectHostUI();
 }
 
 /**
- * 把当前对端请出房间，并记住它 —— 对方再进来会被自动请走。
+ * 刷新房主专属的三个控件。
+ *
+ * 只有第一个进入房间的人（房主）能请人出去 —— 后进来的一方连按钮都不显示。
+ * 服务端会独立校验，前端隐藏只是不让用户白点一下。
+ *
+ * 三个控件：
+ *   · 请出房间     —— 只有房主有
+ *   · 自动请出开关 —— 房主用来自选「拉黑设备再进来是自动赶走还是我自己看着办」
+ *   · 解除拉黑     —— 误请之后的兜底出口（把拉黑名单整个清掉）
+ */
+function reflectHostUI() {
+  $('trust-kick').hidden = !S.isHost;
+  $('autokick-wrap').hidden = !S.isHost;
+  $('autokick').checked = S.autoKick;
+  $('btn-unblock').hidden = !(S.isHost && getBlocked(S.room).length > 0);
+}
+
+/**
+ * 把当前对端请出房间。
  *
  * ⚠ **只有房主（第一个进房的人）能请人出去。** 后进来的一方没有这个能力，
  * 这里做了双重保险：不是房主就直接不动（服务端 _handleKick 也会独立校验，
  * 绕不过去）。
+ *
+ * 是否**顺手拉黑**由「自动请出」开关决定：
+ *   · 开着（默认）→ 记进黑名单，对方再进来自动请走。防陌生人反复试口令。
+ *   · 关着        → 只请出这一次。手滑点错之后，对方还能正常回来找你。
  *
  * 为什么必须能踢：口令是共享秘密，谁拿到都能进。房间上限是 2，
  * 一旦被不认识的人占了位子，真正的对方就永远进不来（会撞到 room-full）。
@@ -903,11 +1030,13 @@ function kickPeer(note) {
   const dev = S.peerDeviceId;
 
   if (target) send({ type: 'kick', room: S.room, peerId: target });
-  if (dev) addBlocked(S.room, dev);
+  if (dev && S.autoKick) addBlocked(S.room, dev);
 
   teardownPeer();
   S.remotePeerId = null;
+  S.peerName = '';          // teardownPeer 刻意不管这个，见那里的说明
   showTrust('', '');
+  syncMeta();
   notice(note || '已把对方请出房间');
   setStatus('waiting', '等待对方接入');
 }
@@ -1061,6 +1190,13 @@ window.__rt = {
   get media() { return { ...S.media }; },
   get remoteMedia() { return { ...S.remoteMedia }; },
   get peerDeviceId() { return S.peerDeviceId; },
+  get myName() { return S.myName; },
+  get peerName() { return S.peerName; },
+  get metaSelf() { return $('meta-self').textContent; },
+  get metaOther() { return $('meta-other').textContent; },
+  get autoKick() { return S.autoKick; },
+  get autokickShown() { return !$('autokick-wrap').hidden; },
+  get blockedCount() { return getBlocked(S.room).length; },
   get isHost() { return S.isHost; },
   get kickBtnShown() { return !$('trust-kick').hidden; },
   get trustShown() { return !$('trust').hidden; },
@@ -1148,6 +1284,28 @@ function boot() {
     toast('已把这台设备记为对方');
   });
   $('trust-kick').addEventListener('click', () => kickPeer());
+
+  // 房主专属：自动请出开关 + 解除拉黑。
+  // 这两个控件存在的唯一理由，是让「误把对方请出去」这件事**有回头路**：
+  // 开关关掉后拉黑名单不再生效，解除按钮则把名单整个清掉。
+  S.autoKick = loadAutoKick();
+  $('autokick').checked = S.autoKick;
+  $('autokick').addEventListener('change', () => {
+    S.autoKick = $('autokick').checked;
+    saveAutoKick(S.autoKick);
+    toast(S.autoKick
+      ? '已开启「自动请出」：拉黑过的设备再进来自动请走'
+      : '已关闭「自动请出」：拉黑过的设备再进来只提示，由你决定');
+  });
+  $('btn-unblock').addEventListener('click', () => {
+    const n = getBlocked(S.room).length;
+    clearBlocked(S.room);
+    reflectHostUI();
+    toast(n ? `已解除对 ${n} 台设备的拉黑，它们可以正常进来了` : '名单本来就是空的');
+  });
+
+  // 机型属于高熵字段，只能异步补 —— 见 refineDeviceName 里的说明
+  refineDeviceName();
 
   $('composer').addEventListener('submit', (ev) => {
     ev.preventDefault();

@@ -351,37 +351,22 @@ export class SignalRoom {
     for (const other of room) existing.push(this._info(other));
 
     /* ------------------------------ 房主判定 ------------------------------
-     * 「第一个进入房间的人」是房主，只有他有「把对方请出去」的权限（见 _handleKick）。
+     * 房主 = **第一个进入这间房的人**，只有他有「把对方请出去」的权限
+     * （见 _handleKick）。房主身份记在**每个成员**的 attachment 上
+     * （roomHost[房间号] = 房主的身份键），谁都能读到「这间房的房主是谁」——
+     * 于是不需要在内存里另维护一张房主表，休眠重建后也不会丢。
      *
-     * 房主身份记在每个成员的 attachment 上（roomHost[房间号] = 房主的身份键），
-     * 用 **clientId** 当身份键，于是：
-     *   · 房主断线重连（clientId 不变）→ 能认领回房主身份，一次网络抖动不会把
-     *     权限永久让给别人；
-     *   · 房主真的走了、房里还有人、又来了新人 → 由当前在房里的「老人」接任，
-     *     否则这间房就再没人能请人了。
+     * 身份键用 clientId（见 _keyOf），它只用来认出「还是同一条连接」，
+     * **不用来做权限继承**。
      *
-     * 判定放在「加入新连接」这一刻做（而不是在 _leave 里做）：因为掉线是瞬时的，
-     * 房主往往几秒后就带着同一个 clientId 回来 —— 只要他赶在下一个新人之前回来，
-     * 房主身份就不会丢。
+     * ⚠ 房主会换人，规则是「**谁先退出谁让位**」，落地在 _leave / _ensureHost：
+     *   · 房里没人   → 我就是房主（第一个到的）
+     *   · 房主还在   → 沿用，后进者没有权限
+     *   · 房主已不在 → 由房里剩下的人接任。正常不会走到这里（_leave 已经即时
+     *                  换好了），这里只是兜底：比如休眠重建后状态不一致。
      */
     const myKey = this._keyOf(cur);
-    let hostKey = '';
-    for (const other of room) {
-      const h = (other.deserializeAttachment() || {}).roomHost;
-      if (h && h[roomId]) { hostKey = h[roomId]; break; }
-    }
-
-    let promoted = null;
-    if (!existing.length) {
-      hostKey = myKey;                       // 房里没人 → 我就是第一个
-    } else if (hostKey !== myKey &&
-               ![...room].some((w) => this._keyOf(w.deserializeAttachment() || {}) === hostKey)) {
-      // 记录的房主已不在房里 → 让仍在房里的那位接任（房间上限 2，此刻房里
-      // 只会有一个「老人」，所以直接取它即可）
-      const heir = room.values().next().value;
-      hostKey = this._keyOf(heir.deserializeAttachment() || {});
-      promoted = heir;
-    }
+    const hostKey = existing.length ? this._ensureHost(roomId, room) : myKey;
     const iAmHost = hostKey === myKey;
 
     // 顺序：先通知房内已有的人，再把「已有的人」回给新来的。
@@ -390,13 +375,6 @@ export class SignalRoom {
     // 需要靠前端的「未知发送者消息缓存」兜住（见 app.js）。
     for (const other of room) {
       this._send(other, { type: 'peer-joined', room: roomId, peer: this._info(ws) });
-    }
-
-    // 房主身份发生了变化（原房主走了、这位老人接任）→ 单独通知他一次，
-    // 客户端据此把「请出房间」按钮亮出来
-    if (promoted && promoted !== ws) {
-      this._setRoomHost(promoted, roomId, hostKey);
-      this._send(promoted, { type: 'host', room: roomId, host: true });
     }
 
     room.add(ws);
@@ -420,11 +398,19 @@ export class SignalRoom {
 
     room.delete(ws);
     const others = [...room];
+    // 只有**两个人都走了**，房间（也就是这个口令的占用）才真正腾出来。
+    // 房里还有人时房间一直开着 —— 这正是「A 退出后 B 还在，房间不关闭」的由来。
     if (room.size === 0) rooms.delete(roomId);
 
     for (const other of others) {
       this._send(other, { type: 'peer-left', room: roomId, peerId: a.peerId });
     }
+
+    // 走掉的如果是房主 → 房里剩下的人**立刻**接任房主（房间继续开着，只是
+    // 「说了算的人」换了一个）。刻意放在这里而不是等下一个新人进来：
+    // 房主退出的那一刻，B 就该拿到权限，而不是「等有人进来才补发」。
+    // 由此推出的产品规则 —— 原房主再进来时是**后进者**，不再有请人出去的权限。
+    if (others.length) this._ensureHost(roomId, room);
   }
 
   /* --------------------------- 房间表 --------------------------- */
@@ -486,6 +472,37 @@ export class SignalRoom {
     rh[roomId] = key;
     this._patch(ws, { roomHost: rh });
     return rh;
+  }
+
+  /**
+   * 确保房间里有一位**在座**的房主，返回房主的身份键。
+   *
+   * 房主不在房里了（主动退出 / 断线 / 从没记录过）→ 把房主身份立刻转给房里
+   * 剩下的人，并单独通知他一声（客户端据此亮出「请出房间」按钮）。
+   * 房间上限是 2，所以「剩下的人」最多一个，取第一个即可。
+   *
+   * ⚠ 刻意**不**做「原房主回来就把身份还给他」：产品规则是「谁先退出谁让位」。
+   *   A 先退出 → B 自动接任房主 → A 再进来就是后进者，没有请人权。
+   *   简单、确定，不会出现两个人争房主。代价是刷新页面也会让位 —— 但这条
+   *   规则本身对用户是好解释的，而「争房主」是没法解释的。
+   */
+  _ensureHost(roomId, room) {
+    let hostKey = '';
+    for (const other of room) {
+      const h = (other.deserializeAttachment() || {}).roomHost;
+      if (h && h[roomId]) { hostKey = h[roomId]; break; }
+    }
+    // 房主还在座 → 什么都不用做
+    if (hostKey && [...room].some((w) => this._keyOf(w.deserializeAttachment() || {}) === hostKey)) {
+      return hostKey;
+    }
+
+    const heir = room.values().next().value;
+    if (!heir) return '';
+    hostKey = this._keyOf(heir.deserializeAttachment() || {});
+    this._setRoomHost(heir, roomId, hostKey);
+    this._send(heir, { type: 'host', room: roomId, host: true });
+    return hostKey;
   }
 
   /**

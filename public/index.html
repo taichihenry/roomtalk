@@ -70,6 +70,23 @@
     </div>
   </header>
 
+  <!-- 设备名条：每台设备进房时自动把自己是什么设备报给对端。
+       口令是共享秘密，光看口令分不清进来的到底是对方还是别人；
+       看到「对方 · Xiaomi 14」才能跟对面口头核对一句「你那边显示的是什么」。 -->
+  <div id="meta" class="meta">
+    <span class="who self">我<b id="meta-self">—</b></span>
+    <span class="who other">对方<b id="meta-other">未进入</b></span>
+    <span class="meta-actions">
+      <!-- 房主专属：被自己请出去过的设备再进来时，是自动请走还是自己看着办。
+           默认自动（防住陌生人不请自来）；误请过人之后可以关掉，把对方放回来。 -->
+      <label id="autokick-wrap" class="switch" hidden
+             title="被拉黑的设备再进来时自动请走。关掉后改由你手动决定，方便误请之后放人回来。">
+        <input type="checkbox" id="autokick"> 自动请出
+      </label>
+      <button id="btn-unblock" class="mini" type="button" hidden>解除拉黑</button>
+    </span>
+  </div>
+
   <div id="trust" class="trust" hidden>
     <span id="trust-text" class="trust-text"></span>
     <span class="trust-actions">
