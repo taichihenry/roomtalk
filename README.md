@@ -95,6 +95,12 @@ export http_proxy=http://127.0.0.1:<当前端口> https_proxy=http://127.0.0.1:<
 仓库：**https://github.com/taichihenry/roomtalk**（public，`main`）。
 Cloudflare 侧用 **Workers Builds** 的 Git 集成监听它，push 到 `main` 就自动构建 + 部署。
 
+> ⚠ **本项目要走「连接已存在的 Worker」，不能走「从仓库新建」。**
+> `roomtalk` 这个 Worker 早就部署过，`8.中国` 的四条自定义域名都挂在它上面。
+> 正确入口是 **点进 roomtalk → Settings → Builds → Connect**。
+> 首页的 *Create application → Import a repository* 那条路是**新建 Worker** 用的，
+> 拿它接本仓库会撞上已存在的 `roomtalk` 名字。（flashdrop 当初是从零开始，所以走的是那条。）
+
 构建配置（控制台：Workers & Pages → roomtalk → Settings → Builds → Connect）：
 
 | 设置项 | 值 | 为什么这么填 |
@@ -109,6 +115,10 @@ Cloudflare 侧用 **Workers Builds** 的 Git 集成监听它，push 到 `main` �
 流程并给你开一个 PR —— 那不是我们要的。填了 `cloudflare` 之后，配置里的
 `[assets] directory = "../public"` 从该目录解析，正好指到仓库里的 `public/`。
 
+⚠ **Worker 名必须和配置里的 `name` 一致。** 官方明确：面板里的 Worker 名与指定根目录下
+`wrangler.toml` 的 `name` 对不上时，**构建会直接失败**。本项目两边都是 `roomtalk`，
+天然满足；但以后若要改名，必须两边同时改。
+
 ⚠ **Durable Object 的 Worker 不生成预览 URL**（Cloudflare 明确说明）。
 所以非生产分支的构建只有校验价值，没有可点的预览地址。不在意的话可以在设置里
 只保留生产分支，省构建时长。
@@ -116,6 +126,9 @@ Cloudflare 侧用 **Workers Builds** 的 Git 集成监听它，push 到 `main` �
 ⚠ **接上 Git 集成后不要再手动 `wrangler deploy`。** 手动部署本身能成功，
 但下一次 push 触发的构建会把版本覆盖回去，容易误判成"我改的东西没上去"。
 紧急绕过 CI 时手动部署仍然可用，只是记得随后补一次 push 让两端对齐。
+
+> **额度**：Workers Builds 免费计划 **3,000 构建分钟/月**。本项目一次构建约 1 分钟，
+> 一个月能推上千次；用完之后只是"构建排队不动了"，**不会自动扣费**。
 
 > 依赖 lock 里的下载地址已统一为官方 `registry.npmjs.org`（不用 `npmmirror`），
 > 避免海外构建环境去拉国内镜像。
