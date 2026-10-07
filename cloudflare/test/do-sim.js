@@ -375,6 +375,15 @@ async function main() {
     const c = await open(room);
     await send(room, c.ws, { type: 'join', room: ROOM_A, clientId: 'cc' });
     const cId = c.ws.deserializeAttachment().peerId;
+
+    // 房主判定：第一个进房的人是房主
+    check('第一个进房的人拿到 host=true',
+      a.ws.sent.find((m) => m.type === 'room-joined')?.host === true,
+      a.ws.sent.find((m) => m.type === 'room-joined'));
+    check('后进房的人拿到 host=false（没有请人出去的权限）',
+      c.ws.sent.find((m) => m.type === 'room-joined')?.host === false,
+      c.ws.sent.find((m) => m.type === 'room-joined'));
+
     a.ws.drain();
     c.ws.drain();
 
@@ -390,6 +399,13 @@ async function main() {
     await send(room, b.ws, { type: 'join', room: ROOM_A, clientId: 'cb' });
     check('真正的对端随后能进来', b.ws.sent.some((m) => m.type === 'room-joined'), types(b.ws.sent));
     check('A 收到新对端', a.ws.sent.some((m) => m.type === 'peer-joined'));
+
+    // ---- 关键新规则：权限只归房主 ----
+    const aIdNow = a.ws.deserializeAttachment().peerId;
+    a.ws.drain();
+    await send(room, b.ws, { type: 'kick', room: ROOM_A, peerId: aIdNow });
+    check('非房主（后进者）不能把房主请出去', !a.ws.sent.some((m) => m.type === 'kicked'), types(a.ws.sent));
+    check('房主在非房主的踢人请求下安然无恙', (room._roomsIndex().get(ROOM_A) || new Set()).has(a.ws));
 
     // ---- 安全边界 ----
     const bId = b.ws.deserializeAttachment().peerId;
@@ -408,6 +424,63 @@ async function main() {
     a.ws.drain();
     await send(room, b.ws, { type: 'kick', room: ROOM_A, peerId: 'no-such-peer' });
     check('踢一个不存在的 peerId 没有副作用', a.ws.sent.length === 0);
+  }
+
+  /* ---------------------------- 12. 房主接任与认领 ---------------------------- */
+  section('12. 房主离开 / 断线重连时的身份归属');
+  {
+    // (a) 房主真的走了 → 房里剩下的老人接任，否则这间房再没人能请人
+    const ctx = new FakeCtx();
+    const room = new SignalRoom(ctx, {});
+    room.ctx = ctx;
+
+    const a = await open(room);
+    await send(room, a.ws, { type: 'join', room: ROOM_A, clientId: 'ca' });
+    const b = await open(room);
+    await send(room, b.ws, { type: 'join', room: ROOM_A, clientId: 'cb' });
+    check('A 是房主', a.ws.sent.find((m) => m.type === 'room-joined')?.host === true);
+    check('B 不是房主', b.ws.sent.find((m) => m.type === 'room-joined')?.host === false);
+
+    a.ws.drain();
+    b.ws.drain();
+    await send(room, a.ws, { type: 'leave', room: ROOM_A });   // 房主离开
+
+    const c = await open(room);
+    await send(room, c.ws, { type: 'join', room: ROOM_A, clientId: 'cc' });
+    check('房主走后，房里剩下的 B 接任（收到 host=true）',
+      b.ws.sent.some((m) => m.type === 'host' && m.host === true), types(b.ws.sent));
+    check('新人 C 依然不是房主',
+      c.ws.sent.find((m) => m.type === 'room-joined')?.host === false);
+
+    const cId = c.ws.deserializeAttachment().peerId;
+    c.ws.drain();
+    await send(room, b.ws, { type: 'kick', room: ROOM_A, peerId: cId });
+    check('接任后的 B 确实能行使房主权限', c.ws.sent.some((m) => m.type === 'kicked'));
+  }
+  {
+    // (b) 房主断线重连（clientId 不变）→ 认得回房主身份，一次网络抖动不会永久丢权限
+    const ctx = new FakeCtx();
+    const room = new SignalRoom(ctx, {});
+    room.ctx = ctx;
+
+    const a = await open(room);
+    await send(room, a.ws, { type: 'join', room: ROOM_A, clientId: 'ca' });
+    const b = await open(room);
+    await send(room, b.ws, { type: 'join', room: ROOM_A, clientId: 'cb' });
+
+    a.ws.readyState = 3;
+    await room.webSocketClose(a.ws);                           // 房主掉线
+    const a2 = await open(room);
+    await send(room, a2.ws, { type: 'join', room: ROOM_A, clientId: 'ca' });   // 带着同一 clientId 回来
+
+    check('房主断线重连后仍是房主',
+      a2.ws.sent.find((m) => m.type === 'room-joined')?.host === true,
+      a2.ws.sent.find((m) => m.type === 'room-joined'));
+
+    const bId = b.ws.deserializeAttachment().peerId;
+    b.ws.drain();
+    await send(room, a2.ws, { type: 'kick', room: ROOM_A, peerId: bId });
+    check('重连回来的房主能请走对方', b.ws.sent.some((m) => m.type === 'kicked'));
   }
 
   /* ---------------------------- 结果 ---------------------------- */

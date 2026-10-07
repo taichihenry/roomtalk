@@ -184,6 +184,7 @@ const S = {
   makingOffer: false,
   ignoreOffer: false,
   settingAnswer: false,
+  isHost: false,        // 我是不是房主（第一个进房的人）—— 只有房主能请人出去
 
   localStream: null,   // 本地音视频源（跨 PC 重建复用）
   remoteStream: null,
@@ -308,6 +309,7 @@ function enterRoom(roomId) {
 function backToGate() {
   S.leaving = true;
   S.started = false;
+  S.isHost = false;
   clearTimeout(S.retryTimer);
   clearTimeout(S.peerLeftTimer);
   stopPing();
@@ -439,7 +441,16 @@ function handleServerMessage(m) {
       break;
 
     case 'room-joined':
+      // 房主身份由服务端判定（第一个进房的人）。只有房主能请人出去，
+      // 后进来的一方没有这个按钮，也没有这个权限。
+      S.isHost = !!m.host;
       setStatus('waiting', '等待对方接入');
+      break;
+
+    case 'host':
+      // 原房主离开、我接任 —— 这时才把「请出房间」的入口给我
+      S.isHost = !!m.host;
+      reflectHostUI();
       break;
 
     case 'room-error':
@@ -824,9 +835,17 @@ function onPeerIdentity(id) {
   if (!id) return;
   S.peerDeviceId = id;
 
-  // 先前被我请出去过的设备又回来了 → 不建立通话，直接再请走
+  // 先前被我请出去过的设备又回来了 → 不建立通话，直接再请走。
+  // 但只有房主有这个权限：不是房主时请不动（服务端也会拒绝），
+  // 这时如实提示用户「你没法请走它，只能自己退出」，别给假承诺。
   if (getBlocked(S.room).includes(id)) {
-    kickPeer('对方是你之前请出过的设备，已再次请出');
+    if (S.isHost) {
+      kickPeer('对方是你之前请出过的设备，已再次请出');
+    } else {
+      showTrust('warn', '⚠️ 对方是你之前请出过的设备，但你不是先进入房间的一方，无法请走它。你可以直接退出房间。');
+      // 这台设备正躺在你的黑名单里，再给「记住这台」是自相矛盾的
+      $('trust-keep').hidden = true;
+    }
     return;
   }
 
@@ -852,18 +871,34 @@ function showTrust(kind, text) {
   $('trust-text').textContent = text;
   // 「记住这台」只在「设备变了」时有意义 —— 首次已经自动记住了
   $('trust-keep').hidden = kind !== 'warn';
-  // 「请出房间」只要人还在房间里就一直可达：这是用户唯一的反悔手段，
-  // 不能因为它藏起来而让人只能关掉页面或者干等
-  $('trust-kick').hidden = false;
+  reflectHostUI();
+}
+
+/**
+ * 按「我是不是房主」决定「请出房间」按钮是否可见。
+ *
+ * 只有第一个进入房间的人（房主）能请人出去 —— 后进来的一方没有这个按钮。
+ * 服务端也会做同样的校验，前端隐藏只是不让用户白点一下。
+ */
+function reflectHostUI() {
+  $('trust-kick').hidden = !S.isHost;
 }
 
 /**
  * 把当前对端请出房间，并记住它 —— 对方再进来会被自动请走。
  *
+ * ⚠ **只有房主（第一个进房的人）能请人出去。** 后进来的一方没有这个能力，
+ * 这里做了双重保险：不是房主就直接不动（服务端 _handleKick 也会独立校验，
+ * 绕不过去）。
+ *
  * 为什么必须能踢：口令是共享秘密，谁拿到都能进。房间上限是 2，
  * 一旦被不认识的人占了位子，真正的对方就永远进不来（会撞到 room-full）。
  */
 function kickPeer(note) {
+  if (!S.isHost) {
+    toast('只有先进入房间的一方能请人出去');
+    return;
+  }
   const target = S.remotePeerId;
   const dev = S.peerDeviceId;
 
@@ -1026,6 +1061,8 @@ window.__rt = {
   get media() { return { ...S.media }; },
   get remoteMedia() { return { ...S.remoteMedia }; },
   get peerDeviceId() { return S.peerDeviceId; },
+  get isHost() { return S.isHost; },
+  get kickBtnShown() { return !$('trust-kick').hidden; },
   get trustShown() { return !$('trust').hidden; },
   get trustClass() { return $('trust').className; },
   get kickedCount() { return S.kickedCount; },

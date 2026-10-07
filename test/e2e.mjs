@@ -254,6 +254,10 @@ async function main() {
   check('数据通道已打开', await A.eval('__rt.dcOpen') && await B.eval('__rt.dcOpen'));
   check('底层是真正的 P2P 连接', await A.eval('__rt.connectionState') === 'connected');
 
+  // 房主 = 第一个进房的人。A 先进，B 后进 —— 权限只给 A
+  check('第一个进房的人（A）是房主', await A.eval('__rt.isHost') === true);
+  check('后进房的人（B）不是房主', await B.eval('__rt.isHost') === false);
+
   // 身份核对：纯口令没法证明「你是这个人」，所以必须如实告诉用户这是第一次
   await waitUntil(async () => A.eval('__rt.trustShown'), 'A 收到身份提示', 12000);
   check('首次通话被明确标注为「第一次」（不假装已经认证过）',
@@ -428,8 +432,10 @@ async function main() {
     .then(() => check('认得的设备不再重复警告', true))
     .catch(async () => check('认得的设备不再重复警告', false, await A.eval('__rt.trustClass')));
 
-  check('熟人状态下「请出房间」依然可达（用户需要能反悔）',
-    await A.eval('!document.getElementById("trust-kick").hidden'));
+  check('熟人状态下「请出房间」依然可达（房主 A 看得到）',
+    await A.eval('__rt.kickBtnShown') === true);
+  check('后进房的人（B）看不到「请出房间」按钮（没有这个权限）',
+    await B.eval('__rt.kickBtnShown') === false);
 
   const kickedBefore = await B.eval('__rt.kickedCount');
   await A.click('trust-kick');                 // 真的去点那个按钮，不走内部函数

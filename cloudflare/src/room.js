@@ -168,6 +168,7 @@ export class SignalRoom {
       clientId: '',     // 由 join 消息带入，用于识别「自己的旧连接」
       name: '',
       rooms: [],
+      roomHost: {},     // { 房间号: 房主的身份键 } —— 见 _join 里的房主判定
       joinedAt: Date.now(),
     });
 
@@ -293,7 +294,7 @@ export class SignalRoom {
       });
       return;
     }
-    this._send(ws, { type: 'room-joined', room: roomId });
+    this._send(ws, { type: 'room-joined', room: roomId, host: !!r.host });
   }
 
   /**
@@ -349,6 +350,40 @@ export class SignalRoom {
     const existing = [];
     for (const other of room) existing.push(this._info(other));
 
+    /* ------------------------------ 房主判定 ------------------------------
+     * 「第一个进入房间的人」是房主，只有他有「把对方请出去」的权限（见 _handleKick）。
+     *
+     * 房主身份记在每个成员的 attachment 上（roomHost[房间号] = 房主的身份键），
+     * 用 **clientId** 当身份键，于是：
+     *   · 房主断线重连（clientId 不变）→ 能认领回房主身份，一次网络抖动不会把
+     *     权限永久让给别人；
+     *   · 房主真的走了、房里还有人、又来了新人 → 由当前在房里的「老人」接任，
+     *     否则这间房就再没人能请人了。
+     *
+     * 判定放在「加入新连接」这一刻做（而不是在 _leave 里做）：因为掉线是瞬时的，
+     * 房主往往几秒后就带着同一个 clientId 回来 —— 只要他赶在下一个新人之前回来，
+     * 房主身份就不会丢。
+     */
+    const myKey = this._keyOf(cur);
+    let hostKey = '';
+    for (const other of room) {
+      const h = (other.deserializeAttachment() || {}).roomHost;
+      if (h && h[roomId]) { hostKey = h[roomId]; break; }
+    }
+
+    let promoted = null;
+    if (!existing.length) {
+      hostKey = myKey;                       // 房里没人 → 我就是第一个
+    } else if (hostKey !== myKey &&
+               ![...room].some((w) => this._keyOf(w.deserializeAttachment() || {}) === hostKey)) {
+      // 记录的房主已不在房里 → 让仍在房里的那位接任（房间上限 2，此刻房里
+      // 只会有一个「老人」，所以直接取它即可）
+      const heir = room.values().next().value;
+      hostKey = this._keyOf(heir.deserializeAttachment() || {});
+      promoted = heir;
+    }
+    const iAmHost = hostKey === myKey;
+
     // 顺序：先通知房内已有的人，再把「已有的人」回给新来的。
     // 两端 WS 是并行的，老设备收到 peer-joined 后会立刻发 offer，
     // 可能比 peers 先到新设备 —— 新设备此时还不知道这个 peerId，
@@ -357,11 +392,20 @@ export class SignalRoom {
       this._send(other, { type: 'peer-joined', room: roomId, peer: this._info(ws) });
     }
 
+    // 房主身份发生了变化（原房主走了、这位老人接任）→ 单独通知他一次，
+    // 客户端据此把「请出房间」按钮亮出来
+    if (promoted && promoted !== ws) {
+      this._setRoomHost(promoted, roomId, hostKey);
+      this._send(promoted, { type: 'host', room: roomId, host: true });
+    }
+
     room.add(ws);
-    this._patch(ws, { rooms: (cur.rooms || []).concat(roomId) });
+    const nextHosts = Object.assign({}, cur.roomHost || {});
+    nextHosts[roomId] = hostKey;
+    this._patch(ws, { rooms: (cur.rooms || []).concat(roomId), roomHost: nextHosts });
 
     this._send(ws, { type: 'peers', room: roomId, peers: existing });
-    return { ok: true };
+    return { ok: true, host: iAmHost };
   }
 
   _leave(ws, roomId) {
@@ -425,6 +469,26 @@ export class SignalRoom {
   }
 
   /**
+   * 一条连接的「身份键」——用于判定它是不是房主。
+   *
+   * 用 **clientId**（前端 sessionStorage 里那个随机串）：同一个标签页断线重连
+   * 时它不变，所以房主掉线再回来能认领回自己的身份。没有 clientId 时才退回
+   * peerId（那种情况下重连会被当成新设备，属于可接受的降级）。
+   */
+  _keyOf(a) {
+    return (a && (a.clientId || a.peerId)) || '';
+  }
+
+  /** 把「这间房的房主是谁」写到某条连接的 attachment 上（合并，不覆盖别的房间）。 */
+  _setRoomHost(ws, roomId, key) {
+    const a = ws.deserializeAttachment() || {};
+    const rh = Object.assign({}, a.roomHost || {});
+    rh[roomId] = key;
+    this._patch(ws, { roomHost: rh });
+    return rh;
+  }
+
+  /**
    * 每连接的固定窗口限流（1 秒）。
    * 用内存 Map 而不是 attachment：写得省，且限流状态本来就允许丢
    * —— DO 既然会休眠，说明根本没什么消息。
@@ -450,10 +514,14 @@ export class SignalRoom {
    * 为什么服务端必须支持这个：口令是**共享秘密** —— 它只证明「知道这串字」，
    * 不证明「你是这个人」。任何拿到口令的人都进得来。而房间上限是 2，
    * 一旦被陌生人占了位子，真正的对方就永远进不来（会收到 room-full）。
-   * 所以房间里的任何一方都必须有「把对方请出去」的能力。
+   * 所以「把对方请出去」这道口子必须留着。
+   *
+   * 但权限只给**房主**（第一个进入这间房的人，见 _join 里的房主判定）：
+   * 后进来的一方没有这个能力。这样「谁先开的口令、谁说了算」是确定的，
+   * 不会出现两个人都能互相请走、来回拉锯。
    *
    * 边界收得很紧：只能踢**自己所在房间里的其他人** ——
-   * 不能踢自己、不能跨房间踢、不在房里的人发这条消息会被直接忽略。
+   * 不能踢自己、不能跨房间踢、不是房主的人发这条消息会被直接忽略。
    */
   _handleKick(ws, msg) {
     const room = msg.room ? this._roomsIndex().get(msg.room) : null;
@@ -462,6 +530,10 @@ export class SignalRoom {
 
     const me = ws.deserializeAttachment() || {};
     if (!msg.peerId || msg.peerId === me.peerId) return;   // 不能踢自己
+
+    // 只有房主能请人出去 —— 这里必须服务端校验，前端藏按钮不算数
+    const host = (me.roomHost || {})[msg.room];
+    if (!host || host !== this._keyOf(me)) return;
 
     for (const other of [...room]) {
       const oa = other.deserializeAttachment() || {};
