@@ -144,6 +144,53 @@ Cloudflare 侧用 **Workers Builds** 的 Git 集成监听它，push 到 `main` �
 > GitHub → Settings → Applications → Cloudflare Workers and Pages → Configure →
 > Repository access，把这个仓库勾上即可。
 
+#### ⚠ 排查：push 成功了，但 Cloudflare 没有任何构建
+
+**症状**：`git push` 返回成功，但部署记录里没有新条目，线上还是旧版本。
+这个坑 2026-10-07 真实踩过一次，**花了一个多小时才定位**，照下面顺序查能省时间。
+
+**根因（最常见）**：GitHub 侧的 `Cloudflare Workers and Pages` App 被卸载/失效了，
+但 **Cloudflare 面板里仍显示"已连接 `taichihenry/roomtalk`"** —— 那是个**孤儿引用**。
+push 产生的 webhook 无处投递，构建永远不会被触发。
+面板上还常常挂一条横幅：
+`There is an internal issue with your Cloudflare ... Git installation`。
+
+**第一步永远是**：浏览器打开 👉 `https://github.com/settings/installations`
+（或 **Settings → Applications → Installed GitHub Apps**），
+看 **`Cloudflare Workers and Pages` 在不在**。
+- **不在** → 就是它。去 `https://github.com/apps/cloudflare-workers-and-pages` → **Install**
+  → 选账户 → 勾仓库 → Install。
+- **在** → 继续往下查（见"其他可能"）。
+
+**修好后必须回 Cloudflare 重连**：因为安装是**账号级**的，重装不会自动修复已存的项目引用。
+进 **roomtalk → Settings → Builds**，先点 **「断开连接」**，再点 **「连接」**，
+重新选账户 / 仓库，表单按上表重填一遍。
+
+**⚠ 这一步每个项目都要各自做一次。** 同一个 app 下的**所有** Workers/Pages
+（本账号还有 `flashdrop`）都要回去"断开 → 重连"，**不会**因为修好了 roomtalk 就自动都好。
+
+**最快的验证方式**（不用翻控制台）：
+```bash
+gh api repos/taichihenry/roomtalk/commits/main/check-runs \
+  --jq '.check_runs[] | .name + " → " + (.conclusion // .status)'
+```
+构建触发后会有一条名为 **`Workers Builds: roomtalk`** 的 check-run
+（`queued → in_progress → success`）。
+> 这点值得记一下：早期以为"Cloudflare 构建不在 GitHub 侧留痕"，**是错的** ——
+> **Worker 项目**的构建会正常发 check-run，`gh` 一条命令就能看状态，比登控制台快得多。
+
+**其他可能**（check-run 出现了但仍失败）：
+| 现象 | 原因 |
+|---|---|
+| 冒出个自动配置 PR / 报找不到配置 | **根目录没填 `cloudflare`** |
+| 构建报 Worker 名不匹配 | 接错了项目，或根目录不对 |
+| `npm ci` 阶段挂 | 依赖装不上（检查 lock 的源） |
+| 部署阶段报鉴权失败 | Builds 令牌权限不够 → 表单里把 API 令牌改成「创建新令牌」 |
+
+> 兜底方案：若重装后横幅仍在（社区确有此类，需提工单让 Cloudflare 后台重置），
+> 改用 **GitHub Actions + `cloudflare/wrangler-action`**，自己在面板建 API Token 存进
+> repo secret，由 Actions 跑 `wrangler deploy`，**完全绕开 Cloudflare 的 Git 集成**。
+
 ---
 
 ## 五、免费额度够用吗
