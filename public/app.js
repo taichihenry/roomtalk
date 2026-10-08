@@ -303,6 +303,7 @@ const S = {
   facing: 'user',       // 摄像头朝向：'user' 前置 | 'environment' 后置
   camCount: 0,          // 探到的摄像头数量（>= 2 才显示「切换前后摄像头」）
   switchingCam: false,  // 正在换摄像头，防连点
+  flipLog: [],          // 最近一次切换的步骤轨迹（给 __rt 看，手机上排障用）
 
   /* ---- 视频区布局 ---- */
   stageMain: null,      // 放大显示哪一格：null = 两格等分 | 'remote' | 'local'
@@ -1703,16 +1704,105 @@ async function refreshCamCount() {
   if (b) b.hidden = n < 2;
 }
 
+/** 「设备忙 / 读不到」类错误 —— 只有这类才值得「先释放旧摄像头再重试」 */
+const CAM_BUSY_ERR = new Set([
+  'NotReadableError', 'TrackStartError', 'AbortError', 'SourceUnavailableError',
+]);
+
+/** 把 getUserMedia 的错误翻成用户能照做的一句话 */
+function camErrText(e) {
+  const n = (e && e.name) || '';
+  if (CAM_BUSY_ERR.has(n)) return '摄像头被占用，请关掉相机、微信等再用';
+  if (n === 'NotAllowedError' || n === 'SecurityError') return '没有摄像头权限';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return '这台设备没有另一颗摄像头';
+  return '这台设备可能只有一颗摄像头';
+}
+
+/** 取 pc 上的视频发送端（可能还没有：视频没接进通话时是 null） */
+function videoSenderOf(pc) {
+  if (!pc) return null;
+  return pc.getSenders().find((s) => s.track && s.track.kind === 'video') || null;
+}
+
+const waitMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 按 deviceId 挑「另一颗」摄像头并打开；挑不出来、或打不开，一律返回 null。
+ * 失败原因 push 进 errs（调用方据此判断值不值得「先释放再重试」）。
+ */
+async function openOtherCamera(facing, excludeId, excludeLabel, errs) {
+  let devs = [];
+  try {
+    devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+  } catch (e) { errs.push(e); return null; }
+
+  // 排除当前那颗。deviceId 拿不到时退用 label；**两者都拿不到就宁可放弃** ——
+  // 此时「另一颗」根本无从分辨，瞎取会换到正在用的那颗，用户看到的就是
+  // 「点了没反应」，比明确报一句失败更糟。
+  let others;
+  if (excludeId) others = devs.filter((d) => d.deviceId && d.deviceId !== excludeId);
+  else if (excludeLabel) others = devs.filter((d) => d.deviceId && d.label !== excludeLabel);
+  else others = [];
+  if (!others.length) return null;
+
+  // 有名字时按名字挑（授权后 label 才非空）；没名字而只排除出一颗，那它就是答案。
+  // label 覆盖中英日文各种写法：Android 给 "Camera 0, Facing back…"，
+  // iOS 给 "Back Camera" / 「背面相机」，国内内核可能给中文。
+  const re = facing === 'environment'
+    ? /back|rear|environment|后置|後置|背面|背向|后面/i
+    : /front|user|前置|正前|前面/i;
+  const pick = others.find((d) => re.test(d.label || '')) || others[0];
+
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({
+      video: { ...videoConstraints(null), deviceId: { exact: pick.deviceId } },
+    });
+    return st.getVideoTracks()[0] || null;
+  } catch (e) { errs.push(e); return null; }
+}
+
+/**
+ * 要一颗指定朝向的新摄像头轨道。两步走：
+ *   ① facingMode: exact —— 语义最准，Android Chrome / iOS Safari 都认
+ *   ② 不认就退回 deviceId，从设备列表里挑「另一颗」
+ * 全失败时，抛出**信息量最大**的那个错误：优先「忙」类（它能指示调用方
+ * 走「先释放再重试」），否则抛第一个。
+ */
+async function openCamera(facing, excludeId, excludeLabel) {
+  const errs = [];
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(facing, true) });
+    const t = st.getVideoTracks()[0];
+    if (t) return t;
+  } catch (e) { errs.push(e); }
+
+  const t = await openOtherCamera(facing, excludeId, excludeLabel, errs);
+  if (t) return t;
+
+  throw errs.find((e) => CAM_BUSY_ERR.has(e && e.name)) || errs[0] || new Error('no other camera');
+}
+
 /**
  * 切换前置 / 后置摄像头（手机上跟微信那个「翻转」是同一件事）。
  *
- * 换轨走 `sender.replaceTrack()`：**不重新协商、不断流、画面不黑**，
- * 只把发送端指向的轨道换掉。换完必须把旧轨道 `stop()` ——
- * 否则摄像头指示灯会一直亮着，用户会以为被偷拍，这个信任代价付不起。
+ * 换轨走 `sender.replaceTrack()`：**不重新协商、不断流、画面不黑**。
+ * 换完必须把旧轨道 `stop()` —— 否则摄像头指示灯会一直亮着，用户会以为
+ * 被偷拍，这个信任代价付不起。
  *
- * 拿新轨道分两步，因为 `facingMode: exact` 不是所有机型都认：
- *   ① 先按 facingMode 要（语义最准）
- *   ② 不行就从 enumerateDevices 里挑「另一颗」，按 deviceId 要
+ * ⚠ 手机上跟桌面上最不一样的一点：**绝大多数手机没法同时打开前后两颗
+ * 摄像头**。桌面可以「先把新流拿到手，再关旧的」；手机这么干，第二次
+ * `getUserMedia` 会直接 NotReadableError（资源被占），切换必然失败。
+ * 所以分两阶段：
+ *
+ *   阶段 A：不动现有画面，直接要新轨道 —— 桌面 / 支持双开的机型走这条，
+ *           全过程没有一帧黑屏。
+ *   阶段 B：A 失败**且错误属于「设备忙/读不到」**时，才先把旧轨 stop() 掉、
+ *           等硬件释放，再要一次；成了就换轨，还是不成 → **回滚**（把原朝向
+ *           重新打开），绝不把用户丢在黑屏上。
+ *
+ * 单摄设备（笔记本、单摄平板）**不会**走进 B：它报的是 OverconstrainedError
+ * （根本没这颗镜头）而不是「忙」，所以现有画面一点没动，直接给一句
+ * 「没有另一颗摄像头」就收工 —— 不会白闪一下摄像头灯。
  */
 async function flipCamera() {
   if (S.switchingCam) return;
@@ -1730,44 +1820,46 @@ async function flipCamera() {
   S.switchingCam = true;
   const btn = $('btn-flip');
   if (btn) btn.disabled = true;
+
+  const prev = S.facing;
+  const oldTrack = S.camTrack;
+  const st0 = (oldTrack.getSettings && oldTrack.getSettings()) || {};
+  const excludeId = st0.deviceId || null;
+  const excludeLabel = oldTrack.label || null;
+
   // 提到 try 外面：中途失败时要负责把它关掉，否则新轨道悬在那儿、摄像头灯灭不了
   let track = null;
-  try {
-    // ① 首选 facingMode: exact
-    try {
-      const st = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(next, true) });
-      track = st.getVideoTracks()[0];
-    } catch { /* 这台设备不认 facingMode，往下走 deviceId */ }
+  let releasedOld = false;   // 旧轨是否已被 stop（决定失败时要不要回滚）
+  S.flipLog = [];
 
-    // ② 退回 deviceId
-    if (!track) {
-      const devs = (await navigator.mediaDevices.enumerateDevices())
-        .filter((d) => d.kind === 'videoinput');
-      const cur = S.camTrack.getSettings ? S.camTrack.getSettings().deviceId : null;
-      const others = devs.filter((d) => d.deviceId && d.deviceId !== cur);
-      if (others.length) {
-        // 有名字时按名字挑（授权后 label 才非空），没名字就取第一颗
-        const named = next === 'environment'
-          ? others.find((d) => /back|rear|environment|后置|背面/i.test(d.label))
-          : others.find((d) => /front|user|前置|正面/i.test(d.label));
-        const pick = named || others[0];
-        const st = await navigator.mediaDevices.getUserMedia({
-          video: { ...videoConstraints(null), deviceId: { exact: pick.deviceId } },
-        });
-        track = st.getVideoTracks()[0];
-      }
+  try {
+    // ---------------- 阶段 A：不动现有画面 ----------------
+    try {
+      track = await openCamera(next, excludeId, excludeLabel);
+    } catch (eA) {
+      S.flipLog.push(`阶段A失败(${eA && eA.name}：${(eA && eA.message) || ''})`);
+      if (!CAM_BUSY_ERR.has(eA && eA.name)) throw eA;
+
+      // ---------------- 阶段 B：先释放旧摄像头，再要一次 ----------------
+      S.flipLog.push('阶段B：先 stop 旧摄像头再重试');
+      releasedOld = true;
+      try { oldTrack.stop(); } catch { /* noop */ }
+      S.camTrack = null;
+      await waitMs(240);   // Android 上 stop() 到硬件真正释放有几十毫秒，太急会照样报占用
+      track = await openCamera(next, excludeId, excludeLabel);
+      S.flipLog.push('阶段B成功');
     }
 
-    if (!track) throw new Error('no other camera');
-
-    const sender = S.pc && S.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    // ---------------- 换轨 ----------------
+    const sender = videoSenderOf(S.pc);
     if (sender) await sender.replaceTrack(track);
 
     if (S.localStream) {
       for (const t of S.localStream.getVideoTracks()) S.localStream.removeTrack(t);
       S.localStream.addTrack(track);      // MediaStream 是活的，换来换去视频元素自动跟着走
     }
-    try { S.camTrack.stop(); } catch { /* noop */ }
+    // 阶段 B 里已经停过了；阶段 A 成功时旧轨还在跑，这里补一刀
+    if (!releasedOld) { try { oldTrack.stop(); } catch { /* noop */ } }
     S.camTrack = track;
     S.facing = next;
 
@@ -1778,17 +1870,43 @@ async function flipCamera() {
     }
     applyMirror();
     tuneVideoSender(S.pc);   // 前后置的采集分辨率/比例可能不同，码率与缩放要重算
-    refreshCamCount();
     queueFitStage();
     toast(next === 'environment' ? '已切到后置摄像头' : '已切到前置摄像头');
   } catch (e) {
-    console.warn(e);
+    console.warn('切换摄像头失败', e, S.flipLog);
     // 拿到手又没用上的那条轨道必须还回去 —— 否则摄像头指示灯会一直亮着
     if (track && track !== S.camTrack) { try { track.stop(); } catch { /* noop */ } }
-    toast('切换失败：这台设备可能只有一颗摄像头');
+
+    // 阶段 B 已经把旧摄像头关掉了：必须把它重新打开，不能把用户丢在黑屏上
+    if (releasedOld && !S.camTrack) {
+      try {
+        const st = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(prev) });
+        const back = st.getVideoTracks()[0];
+        S.camTrack = back;
+        const sender = videoSenderOf(S.pc);
+        if (sender) await sender.replaceTrack(back);
+        if (S.localStream) {
+          for (const t of S.localStream.getVideoTracks()) S.localStream.removeTrack(t);
+          S.localStream.addTrack(back);
+        }
+        const lv = $('local-video');
+        if (lv) { lv.srcObject = S.localStream; lv.play().catch(() => { /* noop */ }); }
+        S.media.video = true;
+        syncMediaUI(); syncStage();
+        S.flipLog.push('已回滚到原摄像头');
+      } catch (e2) {
+        console.warn('回滚也失败，视频暂时不可用', e2);
+        S.media.video = false;
+        syncMediaUI(); syncStage(); pushMediaState();
+        S.flipLog.push(`回滚失败(${e2 && e2.name})`);
+      }
+    }
+    toast('切换失败：' + camErrText(e));
   } finally {
     S.switchingCam = false;
     if (btn) btn.disabled = false;
+    refreshCamCount();     // 换过摄像头后数量可能变（外接设备插拔），按钮要不要留跟着重算
+    queueFitStage();
   }
 }
 
@@ -1927,6 +2045,7 @@ function stopLocalMedia() {
   S.stageMain = null;
   S.pipHinted = false;
   S.facing = 'user';
+  S.flipLog = [];
   applyMirror();
   applyStageLayout();
 }
@@ -2201,6 +2320,12 @@ window.__rt = {
   get facing() { return S.facing; },
   get camCount() { return S.camCount; },
   get flipShown() { return !$('btn-flip').hidden; },
+  /** 最近一次「切换前后摄像头」的步骤轨迹 —— 手机上出问题时报这个最快 */
+  get flipLog() { return S.flipLog.slice(); },
+  /** 手动触发一次切换（等价于点按钮） */
+  flip() { flipCamera(); return true; },
+  /** 重新数一遍摄像头数量（用户去系统设置改过权限后，不用刷新页面） */
+  refreshCams() { refreshCamCount(); },
   get stageMain() { return S.stageMain; },
   get stagePip() { return $('stage').classList.contains('pip'); },
   get smallPane() {

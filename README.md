@@ -377,6 +377,32 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 - **镜像跟着朝向走**：前置镜像（照镜子），后置不镜像（否则拍到的字是反的）；
 - 中途失败会把已经拿到手的新轨道 `stop()` 掉再抛错 —— 否则那条轨道悬着，灯一样灭不了。
 
+#### ⚠ 手机上必须「先关旧的，再开新的」
+
+**绝大多数手机没法同时打开前后两颗摄像头**（camera2 并发只在部分 Android 11+ 机型上
+可用，iOS 从来不给）。桌面可以「先把新流拿到手，再关旧的」，手机这样干，第二次
+`getUserMedia` 会直接抛 `NotReadableError`（资源被占）——**切换必然失败**。
+
+所以 `flipCamera()` 走两阶段：
+
+| 阶段 | 做什么 | 谁会走这条 |
+|---|---|---|
+| **A** | 不动现有画面，直接要新轨道 | 桌面、支持双开的机型 —— **全程没有一帧黑屏** |
+| **B** | A 失败**且错误是「设备忙/读不到」**时，先 `stop()` 旧轨、等 240 ms 让硬件释放，再要一次 | 绝大多数手机 |
+| 失败 | **回滚**：把原朝向重新打开，绝不把用户丢在黑屏上 | 两颗都拿不到时 |
+
+单摄设备**不会**走进 B —— 它报的是 `OverconstrainedError`（根本没这颗镜头）而不是
+「忙」，所以现有画面一点没动，直接提示「没有另一颗摄像头」就收工，不会白闪一下摄像头灯。
+
+另一个坑：`deviceId` 排除不严会**「换到自己」**。`excludeId` 取
+`getSettings().deviceId`，某些机型返回空，此时 `others` 变成全集、`others[0]` 可能
+正是当前那颗 —— 画面没变，用户同样判定为「点了没反应」。所以 `deviceId` 空时退用
+`label` 排除，**两者都拿不到就宁可明确报失败，也不瞎取一颗**。
+
+失败提示按错误码分化（`camErrText()`），不再一律说「可能只有一颗摄像头」——
+`NotReadableError` 会说「摄像头被占用，请关掉相机、微信等再用」，用户才知道该怎么办。
+排障看 `__rt.flipLog`（最近一次切换的步骤轨迹，手机上出问题时报这个最快）。
+
 ---
 
 ## 七、画质档位：让用户自己选
@@ -507,6 +533,7 @@ gh api repos/taichihenry/roomtalk/commits/main/check-runs \
 |---|---|---|
 | 也拿不到麦克风 / 摄像头 | 浏览器或系统的权限没放 | 去「手机设置 → 应用管理 → 浏览器 → 权限」打开，改代码救不回来 |
 | 正常，但本站不行 | 才是本站的问题 | 回来按下面的 `__rt` 查 |
+| 能开摄像头，但点 🔄 切不动 | 手机上多半是「旧摄像头还占着，新那颗打不开」 | 代码已两阶段自愈（见第六节）；仍不行就报 `__rt.flipLog`，它记着每一步 |
 
 入口收在 `<details>` 里默认收起 —— 首屏仍然只有「输口令」一件事。
 外链带 `target="_blank"` + `rel="noopener noreferrer"`。
@@ -530,6 +557,9 @@ __rt.localTag / __rt.remoteTag // 视频窗口角标文案（含设备名与是�
 __rt.facing               // 摄像头朝向：'user' 前置 / 'environment' 后置
 __rt.camCount             // 探到的摄像头数量（>= 2 才显示切换按钮）
 __rt.flipShown            // 「切换前后摄像头」按钮当前可不可见
+__rt.flipLog              // 最近一次切换的步骤轨迹（手机上切不动时报这个最快）
+__rt.flip()               // 手动触发一次切换（等价于点那个 🔄）
+__rt.refreshCams()        // 重新数一遍摄像头（去系统设置改过权限后，不用刷新页面）
 __rt.stageMain            // 视频区布局：null = 两格等分 | 'remote' | 'local'（放大哪一格）
 __rt.stagePip             // 现在是不是「大窗 + 小窗」状态
 __rt.smallPane            // 当前缩成小窗的是哪几格，如 ['local']
@@ -568,12 +598,18 @@ node cloudflare/test/redirect.js      # 19 项，失败必须是 0（http→http
 cd cloudflare
 node node_modules/wrangler/bin/wrangler.js dev --port 8787   # 让它在一个终端里开着
 cd ..
-node test/e2e.mjs                     # 97 项，失败必须是 0
+node test/e2e.mjs                     # 119 项，失败必须是 0
 ```
 
 ⚠ 跑 e2e 前先 `taskkill //F //IM chrome.exe //T`：残留的 Chrome 会占着调试端口 9222，
 报「Chrome 未能就绪」——和代码无关。跑完停 `wrangler dev` 要**杀父 node 进程**
 （`taskkill /T`），只杀占 8787 的 workerd 会被自动重启。
+
+> 本机 headless 只有**一颗假摄像头**，所以 e2e 里「切换前后摄像头」那 5 条是靠
+> **换掉 `navigator.mediaDevices`** 来复现真机的：谎报还有第二颗，并让「明确指定某一颗」
+> 的采集先抛 `NotReadableError`（手机双开被拒时浏览器给的就是这个错）。
+> 三个场景各钉一条：支持双开 → 阶段 A 直接成功；双开被拒 → 阶段 B 降级成功；
+> 怎么都不给 → 回滚且不黑屏。没有这段模拟，这条路径在桌面**永远测不到**。
 
 ### 轻（体积与首屏）
 

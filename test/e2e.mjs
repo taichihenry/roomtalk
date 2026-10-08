@@ -696,6 +696,100 @@ async function main() {
     && (await A.eval(`document.getElementById('local-video').srcObject.getVideoTracks()[0].readyState`)) === 'live',
     { facing: await A.eval('__rt.facing') });
 
+  // --- 8b-4. 模拟真机：手机没法同时开前后两颗摄像头 ---
+  // 本机只有一颗假摄像头（连按钮都不显示），真机双摄才是这个 bug 的现场。
+  // 这里直接换掉 navigator.mediaDevices：谎报还有第二颗，并让「明确指定某一颗」
+  // 的采集先抛 NotReadableError —— 这正是 Android / iOS 双开被拒时浏览器给的错。
+  // 用来看两阶段降级救不救得回来、以及救不回来时会不会把用户丢在黑屏上。
+  const installCamMock = (mode) => `
+    (async () => {
+      const md = navigator.mediaDevices;
+      if (!window.__mdOrig) {
+        window.__mdOrig = { gum: md.getUserMedia.bind(md), ed: md.enumerateDevices.bind(md) };
+      }
+      const o = window.__mdOrig;
+      const MODE = ${JSON.stringify(mode)};
+      window.__mockSpec = 0;
+      const def = (k, v) => Object.defineProperty(md, k, { configurable: true, writable: true, value: v });
+      def('enumerateDevices', async () => [
+        ...(await o.ed()),
+        { deviceId: 'mock-back', groupId: 'g2', kind: 'videoinput', label: 'Back Camera' },
+      ]);
+      def('getUserMedia', async (c) => {
+        const v = (c && c.video) || {};
+        const specified = !!((v.facingMode && v.facingMode.exact) || (v.deviceId && v.deviceId.exact));
+        if (!specified) return o.gum(c);          // 「随便给一颗」的请求照常放行
+        window.__mockSpec++;
+        // 手机的现实：旧摄像头还开着时，要另一颗必被拒。
+        //   ok        —— 支持双开：全程放行
+        //   busy-once —— 阶段 A 两次被拒，释放后第 3 次成功
+        //   forever   —— 怎么都不给
+        const reject = MODE === 'forever' || (MODE === 'busy-once' && window.__mockSpec <= 2);
+        if (reject) {
+          throw Object.assign(new Error('Could not start video source'), { name: 'NotReadableError' });
+        }
+        return o.gum({ video: true });            // 旧轨放掉了 → 这次给一颗真轨道
+      });
+      return true;
+    })()`;
+
+  const uninstallCamMock = `
+    (async () => {
+      const o = window.__mdOrig;
+      if (!o) return false;
+      const md = navigator.mediaDevices;
+      const def = (k, v) => Object.defineProperty(md, k, { configurable: true, writable: true, value: v });
+      def('getUserMedia', o.gum);
+      def('enumerateDevices', o.ed);
+      window.__mdOrig = null;
+      return true;
+    })()`;
+
+  const camSnap = `(async () => {
+    const lv = document.getElementById('local-video');
+    const tr = lv.srcObject ? lv.srcObject.getVideoTracks() : [];
+    const t = tr[0];
+    return { id: t ? t.id : null, n: tr.length, live: !!t && t.readyState === 'live',
+             facing: __rt.facing, log: __rt.flipLog };
+  })()`;
+
+  // 场景一：支持双开的机型（桌面 / 部分旗舰）→ 阶段 A 直接成功，全程没释放过旧摄像头
+  await A.eval(installCamMock('ok'));
+  await A.eval('__rt.flip()');
+  await sleep(1600);
+  const s1 = await A.eval(camSnap);
+  check('支持双开的机型：不释放旧摄像头就能直接换轨成功',
+    s1.facing === 'environment' && s1.live && s1.n === 1
+    && !s1.log.some((l) => l.includes('阶段B')),
+    { facing: s1.facing, log: s1.log });
+
+  // 场景二：**手机的现实** —— 旧摄像头还开着时，要另一颗被拒 → 释放后重试成功
+  await A.eval(installCamMock('busy-once'));
+  await A.eval('__rt.flip()');
+  await sleep(2400);
+  const s2 = await A.eval(camSnap);
+  check('手机双开被拒 → 自动降级「先关旧摄像头再要」，并成功切过去',
+    s2.facing === 'user' && s2.live && s2.n === 1
+    && s2.log.some((l) => l.includes('阶段B成功')),
+    { facing: s2.facing, log: s2.log });
+
+  // 场景三：怎么都拿不到另一颗 → 必须回滚，绝不能停在没有画面的状态
+  await A.eval(installCamMock('forever'));
+  await A.eval('__rt.flip()');
+  await sleep(2600);
+  const s3 = await A.eval(camSnap);
+  const s3toast = await A.eval('document.getElementById("toast").textContent');
+  check('切不过去时回滚到原摄像头，画面仍然是活的（不黑屏）',
+    s3.live && s3.n === 1 && s3.facing === 'user' && s3.log.some((l) => l.includes('回滚')),
+    { facing: s3.facing, live: s3.live, log: s3.log });
+  check('失败提示说清是「被占用」，而不是笼统一句「可能只有一颗」',
+    /占用/.test(s3toast || ''), s3toast);
+
+  await A.eval(uninstallCamMock);
+  await A.eval('__rt.refreshCams()');
+  check('卸掉模拟后回到真实设备：朝向复位为前置',
+    (await A.eval('__rt.facing')) === 'user');
+
   // --- 8c. 语音消息（按住说话）---
   const voiceBefore = await B.eval('__rt.voiceCount');
   await A.click('btn-voice');
