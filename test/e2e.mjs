@@ -471,6 +471,15 @@ async function main() {
   await waitUntil(async () => (await A.eval('__rt.status')).includes('已连接'), 'A 侧恢复', 30000);
   check('两端自动恢复连接，无需用户操作', true);
 
+  // ⚠ 不能只等状态栏那句「已连接」：它是 pc.connectionState 变 connected 时设的，
+  // 而 DataChannel 的 open 通常还在它之后（线上延迟大时这个窗口明显得多）。
+  // 卡在窗口里发消息，sendText() 会因为 dc 还没 open 而返回 false —— 消息压根没
+  // 发出去，看起来就像「重连后消息通道坏了」。判据必须用 dcOpen（README 第九节记过这个坑）。
+  await waitUntil(async () => (await B.eval('__rt.dcOpen')) === true, 'B 的 DataChannel 恢复', 25000)
+    .then(() => check('重连后 DataChannel 真正 open（不只是 PC 通了）', true))
+    .catch(async () => check('重连后 DataChannel 真正 open（不只是 PC 通了）', false,
+      await B.eval('__rt.dcOpen')));
+
   await B.type('重连之后我还在');
   check('重连后消息通道恢复', await waitUntil(
     async () => (await A.eval('__rt.messages')).some((m) => m.text === '重连之后我还在'),
