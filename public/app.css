@@ -257,6 +257,74 @@ button { cursor: pointer; }
 }
 .contact a:hover { color: var(--text); }
 
+/* ---------------------------------------------------------------------------
+   首页的自测入口（展开式）
+   刻意收进 <details>：首屏只留「输口令」一件事，出问题的人自己会展开。
+   --------------------------------------------------------------------------- */
+.selftest {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.selftest > summary {
+  padding: 10px 14px;
+  font-size: 12.5px;
+  color: var(--muted);
+  text-align: center;
+  cursor: pointer;
+  list-style: none;                 /* 去掉系统那个三角，改用下面的 ::before */
+}
+.selftest > summary::-webkit-details-marker { display: none; }
+.selftest > summary::before { content: '▸ '; }
+.selftest[open] > summary {
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+}
+.selftest[open] > summary::before { content: '▾ '; }
+.selftest > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.selftest-body { padding: 12px 14px 14px; }
+.selftest-body p {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
+}
+.selftest-body p:last-child { margin-bottom: 0; }
+.selftest-body b { color: var(--text); font-weight: 600; }
+
+.selftest-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.selftest-links a {
+  flex: 1 1 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  text-align: center;
+  text-decoration: none;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.selftest-links a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--surface);
+}
+
+.selftest-tip { font-size: 11.5px; }
+
 /* ============================ 房间 ============================ */
 
 .room {
@@ -426,6 +494,11 @@ button { cursor: pointer; }
   min-height: 0;
   overflow: hidden;
   background: #0b0d11;
+  cursor: pointer;           /* 整格可点：点一下就是「放大这一格」 */
+}
+.pane:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .pane video {
@@ -436,8 +509,9 @@ button { cursor: pointer; }
   background: #0b0d11;
 }
 
-/* 自己那格水平镜像：看自己的画面像照镜子才自然（不影响发给对方的画面） */
-.pane video#local-video { transform: scaleX(-1); }
+/* 自己那格水平镜像：看自己的画面像照镜子才自然（不影响发给对方的画面）。
+   ⚠ 只在**前置**摄像头时加这个类 —— 切到后置还镜像，拍到的文字就是反的。 */
+.pane video#local-video.mirror { transform: scaleX(-1); }
 
 .pane-tag {
   position: absolute;
@@ -466,6 +540,51 @@ button { cursor: pointer; }
   font-size: 12.5px;
   text-align: center;
   pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+   点一格放大（微信式：大窗铺满 + 另一格缩成右上角小窗）
+
+   默认是上面那个等分布局，只有 .pip 这一档才会变成大小窗 ——
+   用户不点，就永远是对称的两格。
+
+   ⚠ 小窗刻意用 object-fit: cover（轻微裁切）：一眼大小的缩略图里，
+     contain 留下的那圈黑边会让画面只有指甲盖大，什么都看不清。
+     大窗仍然严格 contain 不裁切 —— 那才是「看得见整个人」的那一格。
+   --------------------------------------------------------------------------- */
+.stage.pip {
+  display: block;
+  position: relative;
+  height: min(62dvh, 96vw);
+}
+
+.stage.pip .pane {
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+}
+
+.stage.pip .pane.small {
+  top: 10px; right: 10px; bottom: auto; left: auto;
+  width: 30%;
+  max-width: 140px;
+  aspect-ratio: 3 / 4;      /* 和微信小窗同款竖构图 */
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, .5);
+  z-index: 2;
+}
+
+.stage.pip .pane.small video { object-fit: cover; }
+
+/* 小窗太小，塞不下「对方还没打开摄像头」这种整句 —— 让它当纯色块，别挤成乱码 */
+.stage.pip .pane.small .stage-empty { display: none; }
+
+.stage.pip .pane.small .pane-tag {
+  left: 4px;
+  bottom: 4px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  max-width: calc(100% - 8px);
 }
 
 /* 声音被浏览器拦住时的解锁条 */

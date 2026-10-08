@@ -18,9 +18,10 @@
    =========================================================================== */
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // 本机代理会劫持 localhost，先把环境变量摘干净
 for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'all_proxy']) {
@@ -173,6 +174,19 @@ class Page {
     })()`);
   }
 
+  /**
+   * 视觉留档：把当前视口截一张存到 docs/。
+   * 纯给人眼复核用（等分 / 放大长什么样、小窗位置对不对），**不参与断言** ——
+   * 断言归上面的几何测量，截图只是让 review 的人不用自己跑起来。
+   */
+  async shoot(file) {
+    const r = await this.send('Page.captureScreenshot', { format: 'png' });
+    const abs = join(dirname(fileURLToPath(import.meta.url)), '..', file);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, Buffer.from(r.data, 'base64'));
+    console.log('   · 截图 ' + file);
+  }
+
   /** 用 CDP 的 Browser.close 优雅退出 —— Chrome 的启动器进程早已退出，kill 不到真身 */
   async close() {
     try {
@@ -236,6 +250,18 @@ async function main() {
 
   check('首屏就是输入口令（无多余元素）',
     await A.eval('!document.getElementById("gate").hidden && document.getElementById("room").hidden'));
+
+  // 首页的自测入口：把「浏览器/系统没放权限」和「本站的问题」分开的那两条外链。
+  // 这两条是用户自助排查的第一站，点了没反应比没有更糟，所以 href / target / rel 都钉死。
+  const selftest = await A.eval('__rt.selfTestLinks');
+  check('首页提供了摄像头 / 麦克风自测外链', selftest.length === 2, selftest);
+  check('自测外链分别指向 webcamtests 与 mictests',
+    selftest.some((l) => /webcamtests\.com/.test(l.href))
+    && selftest.some((l) => /mictests\.com/.test(l.href)), selftest);
+  check('自测外链新窗口打开、且带 noopener',
+    selftest.every((l) => l.target === '_blank' && /noopener/.test(l.rel)), selftest);
+  check('自测入口默认收起（首屏仍然只有「输口令」一件事）',
+    (await A.eval('document.querySelector(".selftest").open')) === false);
 
   await A.enter(PASSPHRASE);
   await waitUntil(async () => (await A.eval('__rt.status')).includes('等待对方'), 'A 进房', 15000);
@@ -318,7 +344,17 @@ async function main() {
     vs.degradationPreference === 'maintain-framerate', vs.degradationPreference);
   check('采集端采 720p（再往下压交给编码前缩放，切档才能瞬时生效）',
     vs.captureHeight > 0 && vs.captureHeight <= 720, { w: vs.captureWidth, h: vs.captureHeight });
-  check('视频确实在持续出帧（不是黑屏或停帧）', vs.fps > 0, { fps: vs.fps, sent: vs.bytesSent });
+  // ⚠ 这一条原本只取上面那一次采样。但 Chrome 的 outbound-rtp 里 `framesPerSecond`
+  //   只在「一个统计区间走完」之后才有值：刚连上就取，经常拿到 fps=null 而
+  //   bytesSent 已经有数（说明帧确实在发）—— 单次采样会随机翻车。
+  //   所以这里等一个带上 fps 的样本。**断言没变**（就是要 fps > 0），只是去掉了竞态。
+  let fpsSample = null;
+  check('视频确实在持续出帧（不是黑屏或停帧）',
+    await waitUntil(async () => {
+      fpsSample = await A.eval('__rt.videoStats()');
+      return fpsSample.fps > 0;
+    }, '编码器开始出帧', 12000).then(() => true).catch(() => false),
+    { fps: fpsSample && fpsSample.fps, sent: fpsSample && fpsSample.bytesSent });
   check('受限原因可归因（none / bandwidth / cpu）',
     typeof vs.qualityLimitation === 'string', vs.qualityLimitation);
 
@@ -360,14 +396,27 @@ async function main() {
   check('切回「流畅」：上限回到 600 kbps', qBack.maxBitrate === 600000, qBack.maxBitrate);
 
   // 让编码器实跑 3 秒，量真正吐出去的上行码率 —— 这才是「限码率会不会掉流畅」的实测答案
-  const v1 = await A.eval('__rt.videoStats()');
+  //
+  // ⚠ 两处采样都得挑一挑，否则会随机翻车（改之前踩过）：
+  //   · `bytesSent` 缺失 → delta 算成 NaN（getStats 是按统计区间给的，不是每次都有全部字段）
+  //   · 两次取到**同一个快照** → delta = 0，看着像「没在发」
+  //   所以第二次要等一个「比第一次更大」的样本，并按**真实经过的秒数**换算，
+  //   不能硬除以 3 —— 等样本用掉的时间也算在上行里。
+  const sampleBytes = (min) => waitUntil(async () => {
+    const s = await A.eval('__rt.videoStats()');
+    return (typeof s.bytesSent === 'number' && s.bytesSent > (min ?? -1)) ? s : null;
+  }, '拿到带上行字节数的样本', 12000);
+
+  const t0 = Date.now();
+  const v1 = await sampleBytes();
   await sleep(3000);
-  const v2 = await A.eval('__rt.videoStats()');
-  const kbps = Math.round(((v2.bytesSent - v1.bytesSent) * 8) / 3 / 1000);
-  console.log(`     实测 3 秒：上行 ${kbps} kbps · ${v2.width}x${v2.height} @ ${v2.fps}fps`
+  const v2 = await sampleBytes(v1.bytesSent);
+  const secs = (Date.now() - t0) / 1000;
+  const kbps = Math.round(((v2.bytesSent - v1.bytesSent) * 8) / secs / 1000);
+  console.log(`     实测 ${secs.toFixed(1)} 秒：上行 ${kbps} kbps · ${v2.width}x${v2.height} @ ${v2.fps}fps`
     + ` · 采集 ${v2.captureWidth}x${v2.captureHeight} · 受限原因 ${v2.qualityLimitation}`);
   check('实测上行码率确实在上限之内',
-    kbps > 0 && kbps <= vs.maxBitrate / 1000 + 60, { kbps, cap: vs.maxBitrate / 1000 });
+    kbps > 0 && kbps <= vs.maxBitrate / 1000 + 60, { kbps, cap: vs.maxBitrate / 1000, secs });
 
   check('对方收到了我的画质档位（免得以为是自己的问题）',
     await waitUntil(async () => (await B.eval('__rt.remoteQuality')) === 'smooth', 'B 收到档位', 8000)
@@ -555,6 +604,97 @@ async function main() {
   check('视频窗口角标带上了设备名（视频里也能核对对面是谁）',
     /对方/.test(await A.eval('__rt.remoteTag')) && /我/.test(await A.eval('__rt.localTag')),
     { remote: await A.eval('__rt.remoteTag'), local: await A.eval('__rt.localTag') });
+
+  await A.shoot('docs/shot-stage-even.png');   // 默认：两格等分
+
+  // --- 8b-2. 点一格放大：大窗 + 右上角小窗（微信式）---
+  // 默认是等分（上面刚验过），所以这里只验「点过之后变成什么样、点另一格能不能换回来」。
+  check('没人点之前保持等分，也不带任何放大状态的类',
+    (await A.eval('__rt.stageMain')) === null && (await A.eval('__rt.stagePip')) === false,
+    { main: await A.eval('__rt.stageMain'), pip: await A.eval('__rt.stagePip') });
+
+  await A.eval('document.getElementById("pane-local").click(), true');
+  check('点「我」这格 → 我铺满、对方缩成小窗',
+    (await A.eval('__rt.stageMain')) === 'local'
+    && (await A.eval('__rt.stagePip')) === true
+    && JSON.stringify(await A.eval('__rt.smallPane')) === '["remote"]',
+    { main: await A.eval('__rt.stageMain'), small: await A.eval('__rt.smallPane') });
+
+  await A.eval('document.getElementById("pane-remote").click(), true');
+  check('再点「对方」这格 → 换成对方铺满、我缩成小窗（可来回切）',
+    (await A.eval('__rt.stageMain')) === 'remote'
+    && JSON.stringify(await A.eval('__rt.smallPane')) === '["local"]',
+    { main: await A.eval('__rt.stageMain'), small: await A.eval('__rt.smallPane') });
+
+  // 光看类名不够 —— 真放大得在**几何**上成立：大窗铺满舞台宽度，小窗明显更小
+  const pipBox = await A.eval(`(() => {
+    const s = document.getElementById('stage').getBoundingClientRect();
+    const big = document.querySelector('#stage .pane:not(.small)').getBoundingClientRect();
+    const small = document.querySelector('#stage .pane.small').getBoundingClientRect();
+    return { stageW: Math.round(s.width), bigW: Math.round(big.width),
+             smallW: Math.round(small.width), smallH: Math.round(small.height),
+             smallTop: Math.round(small.top - s.top), smallRight: Math.round(s.right - small.right) };
+  })()`);
+  check('大窗真的铺满了整个舞台宽度', pipBox.bigW >= pipBox.stageW - 2, pipBox);
+  check('小窗确实小（不到大窗的一半宽）', pipBox.smallW > 0 && pipBox.smallW < pipBox.bigW / 2, pipBox);
+  check('小窗贴在舞台右上角',
+    pipBox.smallTop >= 0 && pipBox.smallTop < 40 && pipBox.smallRight >= 0 && pipBox.smallRight < 40, pipBox);
+
+  check('大窗仍然 contain 不裁切，小窗用 cover 当缩略图',
+    await A.eval(`getComputedStyle(document.querySelector('#stage .pane:not(.small) video')).objectFit`) === 'contain'
+    && await A.eval(`getComputedStyle(document.querySelector('#stage .pane.small video')).objectFit`) === 'cover');
+
+  await A.shoot('docs/shot-stage-pip.png');    // 放大后：对方铺满 + 我缩成右上角小窗
+
+  // 摄像头朝向：初始必须是前置（手机上打开视频先看到自己），切换按钮只在真有多摄时露
+  check('开视频默认用前置摄像头', (await A.eval('__rt.facing')) === 'user', await A.eval('__rt.facing'));
+  console.log('   摄像头数量：', await A.eval('__rt.camCount'),
+    '· 切换按钮：', (await A.eval('__rt.flipShown')) ? '显示' : '隐藏');
+
+  // 刻意**不**把布局复位：放大是「用户点过才有的状态」，没有回到等分的入口
+  //（等分只是初始态，不是可来回切的一档）。后面的用例都不依赖舞台等分，
+  // 让 A 停在这个状态反而顺带验证了「放大之后其余功能照常」。
+
+  // --- 8b-3. 切换前后摄像头 ---
+  // headless 只有一个假摄像头，真机才是双摄 —— 所以这里不赌「一定切得过去」，
+  // 只钉死两件绝不能破的事：① 切完本地一定还有一条**活着**的视频轨（黑屏最严重）；
+  // ② 本地流里不能残留旧轨（否则摄像头指示灯灭不掉，用户会以为被偷拍）。
+  const camBefore = await A.eval(`(() => {
+    const lv = document.getElementById('local-video');
+    const t = lv.srcObject && lv.srcObject.getVideoTracks()[0];
+    return { live: !!t && t.readyState === 'live', id: t ? t.id : null,
+             facing: __rt.facing, mirror: lv.classList.contains('mirror') };
+  })()`);
+  check('切之前：前置 + 本地是活画面 + 处于镜像状态',
+    camBefore.live && camBefore.facing === 'user' && camBefore.mirror === true, camBefore);
+
+  await A.click('btn-flip');
+  await sleep(1500);   // 换轨是异步的（要等一次 getUserMedia）
+  const camAfter = await A.eval(`(() => {
+    const lv = document.getElementById('local-video');
+    const tracks = lv.srcObject ? lv.srcObject.getVideoTracks() : [];
+    const t = tracks[0];
+    return { live: !!t && t.readyState === 'live', count: tracks.length, id: t ? t.id : null,
+             facing: __rt.facing, mirror: lv.classList.contains('mirror') };
+  })()`);
+  check('切换后本地仍是活画面（任何情况下都不能黑屏）', camAfter.live, camAfter);
+  check('本地流里只剩一条视频轨（旧轨被停掉了，指示灯能灭）', camAfter.count === 1, camAfter);
+  check('朝向与镜像始终配套：后置不镜像 / 前置才镜像',
+    (camAfter.facing === 'environment' && camAfter.mirror === false)
+    || (camAfter.facing === 'user' && camAfter.mirror === true),
+    { facing: camAfter.facing, mirror: camAfter.mirror });
+  console.log('   一次切换的结果：', camAfter.facing === 'environment' ? '已切到后置' : '本机只有一颗摄像头，保持前置',
+    '· 轨道 id', camBefore.id === camAfter.id ? '未变（同一颗设备）' : '已更换');
+
+  // 切回去了才算真的可来回 —— 顺便把状态还原，后面的用例还在前置上
+  if (camAfter.facing === 'environment') {
+    await A.click('btn-flip');
+    await sleep(1500);
+  }
+  check('摄像头朝向可来回切（切回去仍是可用状态）',
+    (await A.eval('__rt.facing')) === 'user'
+    && (await A.eval(`document.getElementById('local-video').srcObject.getVideoTracks()[0].readyState`)) === 'live',
+    { facing: await A.eval('__rt.facing') });
 
   // --- 8c. 语音消息（按住说话）---
   const voiceBefore = await B.eval('__rt.voiceCount');

@@ -9,13 +9,13 @@
 <meta name="description" content="和对方约定一串口令，输入即接通。文字、语音、视频点对点直达，服务器不经手、不存储。">
 <title>暗号 · 口令通话</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Cpath d='M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z' fill='%23fff' opacity='.92'/%3E%3Ccircle cx='43' cy='24' r='7' fill='none' stroke='%23fff' stroke-width='3.4'/%3E%3Cpath d='M43 31v6' stroke='%23fff' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="app.css?v=20261007">
+<link rel="stylesheet" href="app.css?v=20261008">
 <!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求。
      ⚠ preload 的 href 必须和下面 <script> 的 src **逐字一致（含 ?v=）**，
        否则等于白下两份。
      ⚠ 改了 app.js / app.css，就把这个 ?v= 一起改掉（随意换个值即可）：
        URL 一变缓存立刻失效，用户永远不会拿到「新页面 + 旧脚本」的混搭。 -->
-<link rel="preload" href="app.js?v=20261007" as="script">
+<link rel="preload" href="app.js?v=20261008" as="script">
 </head>
 <body>
 
@@ -42,6 +42,29 @@
   </form>
 
   <footer class="page-foot">
+    <!-- 自测入口：收在 <details> 里，首屏仍然只有「输口令」一件事。
+         出问题的人自己会展开，不出问题的人不会被它挡视线。
+         这两个站是纯前端检测页，专门用来把「浏览器/系统没放权限」和
+         「本站的问题」分开 —— 它们也拿不到麦克风/摄像头，就与本页无关。 -->
+    <details class="selftest">
+      <summary>通话没声音、没画面？先做个自测</summary>
+      <div class="selftest-body">
+        <p>
+          下面两个检测页如果也拿不到麦克风或摄像头，说明是<b>手机或浏览器没放权限</b>，
+          不是本站的问题。去「手机设置 → 应用管理 → 你的浏览器 → 权限」里
+          把麦克风和相机打开，再回来重试。
+        </p>
+        <p class="selftest-links">
+          <a href="https://webcamtests.com/" target="_blank" rel="noopener noreferrer">摄像头自测</a>
+          <a href="https://mictests.com/" target="_blank" rel="noopener noreferrer">麦克风自测</a>
+        </p>
+        <p class="selftest-tip">
+          在微信、QQ 等 App 里打开本页的，先点右上角「…」→「在浏览器打开」：
+          App 内嵌页面的相机麦克风权限归 App 管，网页侧经常要不到。
+        </p>
+      </div>
+    </details>
+
     <p class="foot">
       口令不会离开这台设备——浏览器只在本地把它算成房间号，服务器不知道你们约定了什么，
       也无从反推。通话建立后，消息与音视频在你们两台设备之间直接传输。
@@ -70,6 +93,10 @@
       </select>
       <button id="btn-mic" class="icon" type="button" title="语音" aria-label="语音" aria-pressed="false">🎙</button>
       <button id="btn-cam" class="icon" type="button" title="视频" aria-label="视频" aria-pressed="false">📷</button>
+      <!-- 切换前后摄像头。默认藏起来：只有探到设备上真有 >= 2 颗摄像头才露
+           （见 app.js 的 refreshCamCount），桌面单摄笔记本上没它什么事。 -->
+      <button id="btn-flip" class="icon" type="button" title="切换前后摄像头"
+              aria-label="切换前后摄像头" hidden>🔄</button>
       <button id="btn-hangup" class="icon danger" type="button" title="退出" aria-label="退出">✕</button>
     </div>
   </header>
@@ -99,16 +126,22 @@
     </span>
   </div>
 
-  <!-- 视频舞台：两块窗口**等分**（横屏左右、竖屏上下），尺寸完全一致。
-       不要做成「对方铺满 + 自己小窗」—— 那会让两端显示比例差太多。 -->
+  <!-- 视频舞台：**默认两块窗口等分**（横屏左右、竖屏上下），尺寸完全一致 ——
+       不要做成默认「对方铺满 + 自己小窗」，那会让两端显示比例差太多。
+       但默认之外要留一条出路：用户点某一格，那一格铺满、另一格缩成右上角小窗
+       （微信的做法，见 app.css 的 .stage.pip）。点哪格哪格放大，再点另一格就换回来。 -->
   <div id="stage" class="stage" hidden>
-    <div class="pane">
+    <div class="pane" id="pane-remote" data-slot="remote"
+         role="button" tabindex="0" aria-label="点按放大对方的画面">
       <video id="remote-video" class="remote" autoplay playsinline></video>
       <span class="pane-tag" id="tag-remote">对方</span>
       <div id="stage-empty" class="stage-empty">对方还没打开摄像头</div>
     </div>
-    <div class="pane">
-      <video id="local-video" class="local" autoplay playsinline muted></video>
+    <div class="pane" id="pane-local" data-slot="local"
+         role="button" tabindex="0" aria-label="点按放大我的画面">
+      <!-- mirror = 水平镜像：前置摄像头照镜子才自然（不影响发给对方的画面）。
+           切到后置时由 app.js 摘掉这个类 —— 后置再镜像就把字反过来了。 -->
+      <video id="local-video" class="local mirror" autoplay playsinline muted></video>
       <span class="pane-tag" id="tag-local">我</span>
       <div id="stage-empty-local" class="stage-empty">摄像头未开</div>
     </div>
@@ -156,6 +189,6 @@
 
 <div id="toast" class="toast" hidden role="status"></div>
 
-<script src="app.js?v=20261007"></script>
+<script src="app.js?v=20261008"></script>
 </body>
 </html>

@@ -300,6 +300,13 @@ const S = {
   remoteQuality: null,  // 对端选的档位（只用来提示，不影响我这边）
   media: { audio: false, video: false },        // 本端开关状态
   remoteMedia: { audio: false, video: false },  // 对端开关状态
+  facing: 'user',       // 摄像头朝向：'user' 前置 | 'environment' 后置
+  camCount: 0,          // 探到的摄像头数量（>= 2 才显示「切换前后摄像头」）
+  switchingCam: false,  // 正在换摄像头，防连点
+
+  /* ---- 视频区布局 ---- */
+  stageMain: null,      // 放大显示哪一格：null = 两格等分 | 'remote' | 'local'
+  pipHinted: false,     // 「点一下能放大」只提示一次（每通电话一次）
 
   pending: [],         // 对端未确定时先收到的信令
   peerLeftTimer: null,
@@ -1621,6 +1628,7 @@ async function ensureCam() {
     const lv = $('local-video');
     lv.srcObject = S.localStream;
     lv.play().catch(() => { /* noop */ });
+    applyMirror();
     syncMediaUI(); syncStage(); pushMediaState();
     return true;
   }
@@ -1628,13 +1636,8 @@ async function ensureCam() {
     // 采集端就采 720p：再往下的分辨率交给 scaleResolutionDownBy 在编码前压，
     // 这样切档是瞬时的（不用重启摄像头），「清晰」档也不会被采集上限锁死。
     // max 限死 30fps，避免高刷设备采到 60fps 白烧一倍编码。
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30, max: 30 },
-      },
-    });
+    // 约束统一走 videoConstraints：默认按「前置」要，但只用 ideal —— 单摄设备照样开得起来
+    const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(S.facing) });
     S.camTrack = stream.getVideoTracks()[0];
     ensureLocalStream().addTrack(S.camTrack);
     if (S.pc) {
@@ -1652,8 +1655,141 @@ async function ensureCam() {
     return false;
   }
   S.media.video = true;
+  applyMirror();
+  refreshCamCount();     // 拿到权限后才数得准：按钮该不该露，现在才知道
   syncMediaUI(); syncStage(); pushMediaState();
   return true;
+}
+
+/* ---------------------------- 摄像头朝向 ---------------------------- */
+
+/**
+ * 采集约束。
+ *
+ * `facing` 为什么默认按 **ideal** 传：桌面机、单摄笔记本上根本没有「后置摄像头」
+ * 这个概念，写成 `exact` 会直接抛 OverconstrainedError，把整条视频路打死。
+ * ideal 的语义是「能这样最好，不行就随便给一个」—— 这正是我们要的。
+ * 只有用户**主动点切换**时才用 exact（那时他想换就一定得换成，见 flipCamera）。
+ */
+function videoConstraints(facing, exact = false) {
+  return {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 30 },
+    ...(facing ? { facingMode: exact ? { exact: facing } : { ideal: facing } } : {}),
+  };
+}
+
+/** 前置镜像、后置不镜像。见 CSS 里 .pane video#local-video.mirror */
+function applyMirror() {
+  const lv = $('local-video');
+  if (lv) lv.classList.toggle('mirror', S.facing !== 'environment');
+}
+
+/**
+ * 数一下这台设备有几颗摄像头，决定「切换前后摄像头」按钮露不露。
+ *
+ * 桌面外接单摄、以及只有一颗摄像头的设备上，露出来只会让人白点一次
+ * 然后收到一句失败提示 —— 不如一开始就不显示。
+ */
+async function refreshCamCount() {
+  let n = 0;
+  try {
+    const list = await navigator.mediaDevices.enumerateDevices();
+    n = list.filter((d) => d.kind === 'videoinput').length;
+  } catch { /* 拿不到就当作 0：按钮不显示，功能不受影响 */ }
+  S.camCount = n;
+  const b = $('btn-flip');
+  if (b) b.hidden = n < 2;
+}
+
+/**
+ * 切换前置 / 后置摄像头（手机上跟微信那个「翻转」是同一件事）。
+ *
+ * 换轨走 `sender.replaceTrack()`：**不重新协商、不断流、画面不黑**，
+ * 只把发送端指向的轨道换掉。换完必须把旧轨道 `stop()` ——
+ * 否则摄像头指示灯会一直亮着，用户会以为被偷拍，这个信任代价付不起。
+ *
+ * 拿新轨道分两步，因为 `facingMode: exact` 不是所有机型都认：
+ *   ① 先按 facingMode 要（语义最准）
+ *   ② 不行就从 enumerateDevices 里挑「另一颗」，按 deviceId 要
+ */
+async function flipCamera() {
+  if (S.switchingCam) return;
+  const next = S.facing === 'user' ? 'environment' : 'user';
+
+  // 摄像头还没开：只记下偏好，下次开摄像头时生效。
+  // 此刻也不该去采集 —— 用户没说要开视频，平白亮一下摄像头灯是冒犯。
+  if (!S.camTrack) {
+    S.facing = next;
+    applyMirror();
+    toast(next === 'environment' ? '已设为后置，下次开摄像头生效' : '已设为前置，下次开摄像头生效');
+    return;
+  }
+
+  S.switchingCam = true;
+  const btn = $('btn-flip');
+  if (btn) btn.disabled = true;
+  // 提到 try 外面：中途失败时要负责把它关掉，否则新轨道悬在那儿、摄像头灯灭不了
+  let track = null;
+  try {
+    // ① 首选 facingMode: exact
+    try {
+      const st = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(next, true) });
+      track = st.getVideoTracks()[0];
+    } catch { /* 这台设备不认 facingMode，往下走 deviceId */ }
+
+    // ② 退回 deviceId
+    if (!track) {
+      const devs = (await navigator.mediaDevices.enumerateDevices())
+        .filter((d) => d.kind === 'videoinput');
+      const cur = S.camTrack.getSettings ? S.camTrack.getSettings().deviceId : null;
+      const others = devs.filter((d) => d.deviceId && d.deviceId !== cur);
+      if (others.length) {
+        // 有名字时按名字挑（授权后 label 才非空），没名字就取第一颗
+        const named = next === 'environment'
+          ? others.find((d) => /back|rear|environment|后置|背面/i.test(d.label))
+          : others.find((d) => /front|user|前置|正面/i.test(d.label));
+        const pick = named || others[0];
+        const st = await navigator.mediaDevices.getUserMedia({
+          video: { ...videoConstraints(null), deviceId: { exact: pick.deviceId } },
+        });
+        track = st.getVideoTracks()[0];
+      }
+    }
+
+    if (!track) throw new Error('no other camera');
+
+    const sender = S.pc && S.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(track);
+
+    if (S.localStream) {
+      for (const t of S.localStream.getVideoTracks()) S.localStream.removeTrack(t);
+      S.localStream.addTrack(track);      // MediaStream 是活的，换来换去视频元素自动跟着走
+    }
+    try { S.camTrack.stop(); } catch { /* noop */ }
+    S.camTrack = track;
+    S.facing = next;
+
+    const lv = $('local-video');
+    if (lv) {
+      lv.srcObject = S.localStream;
+      lv.play().catch(() => { /* 某些浏览器换轨后会暂停，补一次播放；失败也不致命 */ });
+    }
+    applyMirror();
+    tuneVideoSender(S.pc);   // 前后置的采集分辨率/比例可能不同，码率与缩放要重算
+    refreshCamCount();
+    queueFitStage();
+    toast(next === 'environment' ? '已切到后置摄像头' : '已切到前置摄像头');
+  } catch (e) {
+    console.warn(e);
+    // 拿到手又没用上的那条轨道必须还回去 —— 否则摄像头指示灯会一直亮着
+    if (track && track !== S.camTrack) { try { track.stop(); } catch { /* noop */ } }
+    toast('切换失败：这台设备可能只有一颗摄像头');
+  } finally {
+    S.switchingCam = false;
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function toggleMic() {
@@ -1785,6 +1921,14 @@ function stopLocalMedia() {
   if (lv.srcObject) lv.srcObject = null;
   setAudioBlocked(false);
   dismissRing();
+
+  // 布局与摄像头偏好一并复位：下一通回到默认的「两格等分 + 前置摄像头」，
+  // 就像刚打开一样 —— 上一通点过放大、翻过后置，不该带到下一通里。
+  S.stageMain = null;
+  S.pipHinted = false;
+  S.facing = 'user';
+  applyMirror();
+  applyStageLayout();
 }
 
 /* ============================== 界面同步 ============================== */
@@ -1861,6 +2005,50 @@ function syncStage() {
     tagL.textContent = parts.join(' · ');
   }
 
+  // 「点一下能放大」这个交互**没有任何视觉入口** —— 不主动说一次，没人会去试。
+  // 只说一次（每通电话一次），说多了就是噪音。
+  if (!S.pipHinted && S.media.video && S.remoteMedia.video) {
+    S.pipHinted = true;
+    notice('点任意一格画面可以放大，再点另一格就换回来');
+  }
+
+  applyStageLayout();
+}
+
+/* ---------------------------- 视频区：等分 / 放大 ---------------------------- */
+
+/**
+ * 点某一格 = 把那一格放大、另一格缩成右上角小窗（微信的做法）。
+ *
+ * 默认仍是**两格等分**：那是「两端看到的一样大」的前提，不能丢。
+ * 两档之间不做任何自动切换 —— 只有用户点过才会变，否则画面自己跳来跳去更烦人。
+ */
+function setStageMain(slot) {
+  // 点的那格必须真的有画面：把一块「对方还没打开摄像头」的占位放大毫无意义
+  if (slot === 'local' && !S.media.video) return;
+  if (slot === 'remote' && !S.remoteMedia.video) return;
+  if (S.stageMain === slot) return;      // 已经是大的了，再点不做事
+  S.stageMain = slot;
+  applyStageLayout();
+}
+
+/** 把 S.stageMain 落到 DOM 上（.pip + 哪一格 .small），并重算高度。 */
+function applyStageLayout() {
+  const stage = $('stage');
+  if (!stage) return;
+
+  // 放大那格的主人把摄像头关了 → 立刻回落等分，别把一块占位框放大着
+  if (S.stageMain && !(S.stageMain === 'local' ? S.media.video : S.remoteMedia.video)) {
+    S.stageMain = null;
+  }
+
+  const pip = !!S.stageMain;
+  stage.classList.toggle('pip', pip);
+  const paneR = $('pane-remote');
+  const paneL = $('pane-local');
+  if (paneR) paneR.classList.toggle('small', pip && S.stageMain !== 'remote');
+  if (paneL) paneL.classList.toggle('small', pip && S.stageMain !== 'local');
+
   fitStage();
 }
 
@@ -1872,8 +2060,9 @@ function syncStage() {
  * 用 object-fit: contain 不裁切是对的，但如果格子比例和画面差太多，
  * 就会留出很宽的黑边，看着像「没铺满」。
  *
- * 所以拿到真实分辨率后重算一次格子高度：两格宽度固定是 (舞台宽 - 间隙) / 2，
- * 高度 = 格宽 / 画面比例。这样 contain 几乎不留黑边，同时**两块格子依然等大**。
+ * 所以拿到真实分辨率后重算一次格子高度：等分时格宽 = (舞台宽 - 间隙) / 2，
+ * 放大时格宽就是整个舞台宽；高度 = 格宽 / 画面比例。这样 contain 几乎不留黑边，
+ * 同时**两块格子依然等大**。
  *
  * 优先用对方画面的比例 —— 屏幕上主要看的是对方。
  * 上限压到视口高度的 62%，免得一块竖屏画面把聊天区整个吃掉。
@@ -1887,7 +2076,9 @@ function fitStage() {
   const ratio = ratioOf($('remote-video')) || ratioOf($('local-video'));
   if (!ratio) { stage.style.height = ''; return; }   // 回落到 CSS 的默认高度
 
-  const paneW = Math.max(0, (stage.clientWidth - 2) / 2);
+  // 放大模式只有一格，等分模式两格；间隙 2px 与 CSS 里 .stage 的 gap 保持一致
+  const cols = S.stageMain ? 1 : 2;
+  const paneW = Math.max(0, (stage.clientWidth - (cols - 1) * 2) / cols);
   if (!paneW) return;
   const h = Math.round(Math.max(110, Math.min(paneW / ratio, window.innerHeight * 0.62)));
   // 读 clientWidth 会强制一次同步布局，所以只在高度真的变了时才写回去 ——
@@ -2007,6 +2198,17 @@ window.__rt = {
   get stageShown() { return !$('stage').hidden; },
   get localTag() { return $('tag-local').textContent; },
   get remoteTag() { return $('tag-remote').textContent; },
+  get facing() { return S.facing; },
+  get camCount() { return S.camCount; },
+  get flipShown() { return !$('btn-flip').hidden; },
+  get stageMain() { return S.stageMain; },
+  get stagePip() { return $('stage').classList.contains('pip'); },
+  get smallPane() {
+    return [...document.querySelectorAll('#stage .pane.small')].map((p) => p.dataset.slot);
+  },
+  get selfTestLinks() {
+    return [...document.querySelectorAll('.selftest a')].map((a) => ({ href: a.href, target: a.target, rel: a.rel }));
+  },
 
   /** 仅供自动化测试：模拟「浏览器判定这条连接已经死了」 */
   __dropSocket() { handleSocketLost(); },
@@ -2135,6 +2337,27 @@ function boot() {
 
   $('btn-mic').addEventListener('click', toggleMic);
   $('btn-cam').addEventListener('click', toggleCam);
+  $('btn-flip').addEventListener('click', flipCamera);
+
+  // 视频区：点哪一格，哪一格放大（另一格缩成小窗）。键盘 Enter / 空格同样可用 ——
+  // 这两格是 role="button"，不让键盘用户点得动就是假的按钮。
+  for (const slot of ['remote', 'local']) {
+    const pane = $('pane-' + slot);
+    pane.addEventListener('click', () => setStageMain(slot));
+    pane.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        setStageMain(slot);
+      }
+    });
+  }
+
+  // 外接摄像头插拔时按钮该出现 / 消失
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', refreshCamCount);
+  }
+  // 有些浏览器还没授权也能列出设备数量，先问一次；拿不到就等 ensureCam 成功后再问
+  refreshCamCount();
 
   // 画面分辨率一出来（或旋转屏幕、改窗口大小）就重算视频区高度 —— 见 fitStage。
   // 统一走 queueFitStage：这几个事件全是高频的，合并到帧上再算，别让布局抖成筛子。
