@@ -687,6 +687,8 @@ __rt.ringShown            // 是否正在响来电
 __rt.callKind             // 通话类型：null = 不在通话 | 'audio' | 'video'
 __rt.inCall               // 是否在通话中（等价 S.callKind !== null）
 __rt.callRinging          // 是否还在「呼叫中」（对方尚未接听）
+__rt.callLive             // 双方是否已真正接通（呼叫中、未接听时为 false）
+__rt.ringGone             // 这颗来电是否已作废（对方挂断 / 超时）
 __rt.callUiShown          // 全屏通话界面是否显示着
 __rt.callMode             // 房间是否处于 call-mode（聊天外壳已收起）
 __rt.callTimerText        // 通话时长文案，如 "01:23"
