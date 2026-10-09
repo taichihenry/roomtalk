@@ -216,7 +216,8 @@ export class SignalRoom {
         break;
 
       case 'leave':
-        if (typeof msg.room === 'string') this._leave(ws, msg.room);
+        // 主动退房：明确告诉对端「他不会回来了」，好让他立刻收摊
+        if (typeof msg.room === 'string') this._leave(ws, msg.room, 'leave');
         break;
 
       case 'signal':
@@ -252,7 +253,8 @@ export class SignalRoom {
     // （key 是 ws 对象，连接没了就再没人能取到它，纯泄漏）
     this._rate.delete(ws);
     const att = ws.deserializeAttachment() || {};
-    for (const roomId of [...(att.rooms || [])]) this._leave(ws, roomId);
+    // 意外断开（不是用户点的 ✕）→ 'closed'：对端别急着收摊，留宽限期等他重连回来
+    for (const roomId of [...(att.rooms || [])]) this._leave(ws, roomId, 'closed');
   }
 
   async webSocketError(ws) {
@@ -386,7 +388,18 @@ export class SignalRoom {
     return { ok: true, host: iAmHost };
   }
 
-  _leave(ws, roomId) {
+  /**
+   * 把 ws 从房间移除，并通知房里其他人。
+   *
+   * `reason` 是要紧的一件事 —— 对端收到 `peer-left` 后该不该**立刻收摊**全看它：
+   *   · 'leave'  对方主动退房（点了 ✕）。他不会再回来了（即使回来也是「后进者」，
+   *              是新的一轮），对端必须立刻收掉摄像头，不能让人对着空房间干等。
+   *   · 'closed' 连接意外断开。很可能只是网络抖动、马上会带同一个 clientId 重连，
+   *              对端要留够宽限期（通话中尤其不能急着掐 —— 见客户端的
+   *              PEER_LEFT_GRACE_CALL：信令断了不等于媒体断了）。
+   * 默认取 'closed'：拿不准时按「他可能回来」处理，宁可多等一会儿，不可误杀。
+   */
+  _leave(ws, roomId, reason = 'closed') {
     const a = ws.deserializeAttachment() || {};
     if (!(a.rooms || []).includes(roomId)) return;   // 本来就不在这间房，别广播
 
@@ -409,7 +422,7 @@ export class SignalRoom {
     if (room.size === 0) rooms.delete(roomId);
 
     for (const other of others) {
-      this._send(other, { type: 'peer-left', room: roomId, peerId: a.peerId });
+      this._send(other, { type: 'peer-left', room: roomId, peerId: a.peerId, reason });
     }
 
     // 走掉的如果是房主 → 房里剩下的人**立刻**接任房主（房间继续开着，只是

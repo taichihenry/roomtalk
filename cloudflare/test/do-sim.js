@@ -232,7 +232,11 @@ async function main() {
 
     // 主动离开
     await send(room, b.ws, { type: 'leave', room: ROOM_A });
-    check('主动退房会通知对方', a.ws.sent.some((m) => m.type === 'peer-left'));
+    // ⚠ reason 必须区分：对端就是靠它决定「立刻收摊」还是「留宽限期等重连」。
+    // 少了它就只能一律留宽限期 —— 人的主动退出会被拖成 20 秒，对方干瞪眼。
+    check('主动退房会通知对方，且说明是主动离开',
+      a.ws.sent.some((m) => m.type === 'peer-left' && m.reason === 'leave'),
+      a.ws.sent.filter((m) => m.type === 'peer-left'));
     a.ws.drain();
     b.ws.drain();
 
@@ -241,7 +245,9 @@ async function main() {
     a.ws.drain();
     b.ws.readyState = 3;
     await room.webSocketClose(b.ws);
-    check('断线会通知对方', a.ws.sent.some((m) => m.type === 'peer-left'));
+    check('断线会通知对方，且说明是意外断开（对端据此留宽限期等重连）',
+      a.ws.sent.some((m) => m.type === 'peer-left' && m.reason === 'closed'),
+      a.ws.sent.filter((m) => m.type === 'peer-left'));
 
     // 限流桶必须随连接一起回收（Map 的 key 是 ws 对象，不删就是纯泄漏）
     // 注意只查已断开的那条：同房间的 A 还活着，它的桶本来就该在

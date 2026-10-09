@@ -517,6 +517,13 @@ async function main() {
     await A.eval('__rt.inCall') === true && await A.eval('__rt.media.audio') === true,
     { kind: await A.eval('__rt.callKind'), media: await A.eval('__rt.media') });
 
+  // ⚠ 这条是**线上翻过车**的地方：不能只靠「重连后通话还在不在」来验，
+  // 因为本地 wrangler dev 同进程重连只要几十毫秒，1.5 秒的宽限期怎么都够，
+  // 线上却要「退避 + WS 握手 + 重新注册」远超 1.5 秒 —— 宽限期一到就把正在
+  // 进行的通话掐了。所以直接断言「通话态的宽限期必须给足」，与网络快慢无关。
+  check('通话中「对方离开」的宽限期给足 20 秒（短于线上重连耗时就会误杀通话）',
+    await A.eval('__rt.peerLeftGrace') >= 20000, await A.eval('__rt.peerLeftGrace'));
+
   // 掐掉 B 的信令连接，模拟网络抖动 / 切基站
   await B.eval('window.__rt.__dropSocket(), true');
   await waitUntil(async () => (await B.eval('__rt.status')).includes('重连'), 'B 进入重连状态', 10000);
@@ -982,8 +989,11 @@ async function main() {
     { camWasOn });
   await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
   check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);
+  // ⚠ 这里刻意只等 6 秒（而不是宽限期的 20 秒）：对方是**主动退房**，走的是
+  // endCall() 发出的 bye —— 那条是端到端、秒级到达的。若谁把「主动离开」也
+  // 拖到 peer-left 的宽限期上，这条就会红，正是我们要拦住的行为。
   check('对方退出后，我这边的通话也自动收掉了（不会留一个对着空房间的摄像头）',
-    await waitUntil(async () => (await B.eval('__rt.inCall')) === false, 'B 退出通话', 20000)
+    await waitUntil(async () => (await B.eval('__rt.inCall')) === false, 'B 退出通话', 6000)
       .then(() => true).catch(() => false), await B.eval('__rt.callKind'));
   await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
   check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);

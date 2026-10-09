@@ -44,7 +44,20 @@ const PING_INTERVAL = 25_000;
  */
 const PONG_TIMEOUT = 8_000;
 
-const PEER_LEFT_GRACE = 1_500;  // 对方断开后等这么久再宣布，避开「重连抖动」
+/*
+ * 对方信令断开后「等多久才宣布他真的走了」。
+ * 分成两个值，因为这两件事的代价完全不同：
+ *
+ *   · 聊天态 1.5 秒足够 —— 就是躲一下重连抖动，本来也没什么可失去的。
+ *   · 通话态必须给足产品对外承诺的重连窗口（20 秒）。⚠ 这是线上才暴露的问题：
+ *     线上重连要走「退避 + WS 握手 + 重新注册」，远超 1.5 秒；而本地 wrangler dev
+ *     在同进程里几十毫秒就重连完 —— 所以 1.5 秒在本地永远够用、线上必现误杀。
+ *     表现就是「对方网络抖了一下，我这边通话被掐了」。
+ *     更不该急着收的理由：**WebRTC 媒体是端到端的**，信令断了媒体往往还活着，
+ *     一个正在进行的通话不该因为一次信令抖动就被判死刑。
+ */
+const PEER_LEFT_GRACE = 1_500;
+const PEER_LEFT_GRACE_CALL = 20_000;
 const PENDING_TTL = 15_000;     // 未知发送者的信令缓存时长
 
 /*
@@ -806,7 +819,11 @@ function handleServerMessage(m) {
 
     case 'peer-joined':
       // 有人进来了 → 我主叫
+      // 之前挂着 peerLeftTimer 说明刚刚经历过一次「等待对方重连」；这通电话要是
+      // 还没断，就明确告诉用户「接回来了」—— 不然他只知道断过、不知道已经好了。
+      if (S.peerLeftTimer && inCall()) notice('对方已重新接入，通话继续');
       clearTimeout(S.peerLeftTimer);
+      S.peerLeftTimer = null;
       S.peerName = m.peer.name || '';
       syncMeta();
       setStatus('waiting', '已找到对方，正在建立连接…');
@@ -814,7 +831,9 @@ function handleServerMessage(m) {
       break;
 
     case 'peer-left':
-      if (m.peerId === S.remotePeerId) handlePeerLeft();
+      // reason === 'leave' 是「对方主动退房，他不会再回来了」→ 立刻收摊；
+      // 缺省（'closed'）是「连接断了」→ 交给 handlePeerLeft 按状态给宽限期。
+      if (m.peerId === S.remotePeerId) handlePeerLeft(m.reason === 'leave');
       break;
 
     case 'kicked':
@@ -850,10 +869,8 @@ function failToGate(reason) {
   showError(reason);
 }
 
-function handlePeerLeft() {
-  // 等一小会儿再宣布 —— 对端可能只是断线重连，马上就会带新身份回来
-  clearTimeout(S.peerLeftTimer);
-  S.peerLeftTimer = setTimeout(() => {
+function handlePeerLeft(byChoice = false) {
+  const reallyGone = () => {
     teardownPeer();
     dismissRing();
     // 对端真走了 → 通话也结束：本地媒体必须收掉，否则摄像头指示灯一直亮着
@@ -863,7 +880,29 @@ function handlePeerLeft() {
     syncMeta();
     notice('对方已离开');
     setStatus('waiting', '等待对方接入');
-  }, PEER_LEFT_GRACE);
+  };
+
+  // 对方**主动退房**（点了 ✕）：不存在「他马上回来」这回事 —— 即使回来也是后进者、
+  // 是新的一轮。所以立刻收摊，别让人对着一个已经空了的房间干等 20 秒。
+  //
+  // ⚠ 这条路径不能只靠端到端的 bye：bye 走 DataChannel 的 send() 是排队的，
+  // 退房时紧接着就 teardownPeer() 把连接拆了，那条 bye 经常还没出网就被丢掉。
+  // 服务端在 peer-left 上带的 reason 才是可靠信号（它走 WS，先发后关）。
+  if (byChoice) {
+    clearTimeout(S.peerLeftTimer);
+    S.peerLeftTimer = null;
+    reallyGone();
+    return;
+  }
+
+  // 意外断开：等一小会儿再宣布 —— 对端可能只是断线重连，马上就会带新身份回来。
+  // 通话中这个「一小会儿」要长得多（见 PEER_LEFT_GRACE_CALL 的说明）：信令断了
+  // 不等于媒体断了，一次网络抖动不该把正在进行的通话掐掉。等待期间给用户一句
+  // 交代，否则画面卡住却毫无解释，只会让人以为「卡死了」。
+  const grace = inCall() ? PEER_LEFT_GRACE_CALL : PEER_LEFT_GRACE;
+  if (inCall()) notice('对方连接中断，正在等待重连…');
+  clearTimeout(S.peerLeftTimer);
+  S.peerLeftTimer = setTimeout(reallyGone, grace);
 }
 
 /* ============================== WebRTC ============================== */
@@ -2588,6 +2627,13 @@ window.__rt = {
   get callTimerText() { return $('call-timer').textContent; },
   get callPeerText() { return $('call-peer').textContent; },
   get callStateText() { return $('call-state').textContent; },
+  /**
+   * 此刻「对方信令断开」会等多久才宣布他真的走了（毫秒）。
+   * 通话中必须给足（20 秒）—— 线上重连远比 1.5 秒慢，短了会把正在进行的通话误杀。
+   * 把它暴露出来是因为这个 bug **本地永远复现不了**（wrangler dev 同进程重连只要
+   * 几十毫秒），只能靠断言「宽限期本身够不够长」来钉住。
+   */
+  get peerLeftGrace() { return inCall() ? PEER_LEFT_GRACE_CALL : PEER_LEFT_GRACE; },
   /** 通话全屏时输入栏应当被收起 —— 这正是「不能再点发起通话」的界面保证 */
   get composerHidden() { return getComputedStyle($('composer')).display === 'none'; },
   /** 「按住说话」那颗按钮的实际尺寸（验证它真的是个放大的圆） */
@@ -2797,7 +2843,12 @@ function boot() {
   qSel.addEventListener('change', onQualityChange);
 
   $('btn-hangup').addEventListener('click', () => {
-    // 先告诉对方一声，让他那边立刻收到 peer-left 而不是等超时
+    // 通话中主动退房 = 「确定要走」，要先把这一通挂掉（发 bye），让对端**立刻**
+    // 收掉摄像头 —— 而不是干等 peer-left 的宽限期。通话态那个宽限期是专门留给
+    // 「网络抖动、等着重连」的（20 秒），拿它来延迟「对方主动离开」毫无道理，
+    // 对方会对着一个已经空了的房间干瞪 20 秒。
+    if (inCall()) endCall();
+    // 再告诉对方一声，让他那边立刻收到 peer-left 而不是等超时
     send({ type: 'leave', room: S.room });
     backToGate();
   });
