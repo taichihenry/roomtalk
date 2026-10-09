@@ -973,6 +973,75 @@ async function main() {
     await waitUntil(async () => (await B.eval('__rt.voiceCount')) > voiceBefore, 'B 收到语音', 30000)
       .then(() => true).catch(async () => check('B 收到语音', false, await B.eval('__rt.voiceCount'))));
 
+  /* --- 手机上「按住说话」按不住：把三条来路都钉住 ---
+     这类问题在 headless 里复现不了（合成事件不会被浏览器收走），所以只能分别
+     验证「防线的每一环在位」+「万一还是被打断，结果必须是可预期的」。 */
+
+  // ① 浏览器把这次触摸收走（判成长按/滚动/缩放、或同时触点过多 —— 单手拿手机时
+  //    掌根贴屏就属于这种）就会发 pointercancel，录音当场断掉。能不能被收走取决于
+  //    touch-action，所以先断言它真的生效了（连子元素一起）—— 这是本机唯一能验的一半。
+  const ta = await A.eval(`(() => {
+    const b = document.getElementById('hold-talk');
+    return { self: getComputedStyle(b).touchAction,
+             kids: [...b.children].map((c) => getComputedStyle(c).touchAction) };
+  })()`);
+  check('按住按钮自己 + 里面的图标/文字都不让浏览器插手手势（touch-action: none）',
+    ta.self === 'none' && ta.kids.length > 0 && ta.kids.every((v) => v === 'none'), ta);
+
+  // ② 别的指针抬起不许打断正在录的语音。原来 pointerup 挂在 window 上，任何一次
+  //    指针抬起（另一根手指、鼠标兼容事件、别处的点击）都会把这次录音掐掉。
+  const voiceAfterFirst = await A.eval('__rt.voiceCount');
+  await A.eval(`(() => {
+    document.getElementById('hold-talk').dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 7 }));
+    return true;
+  })()`);
+  await sleep(700);
+  await A.eval(`window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 99 })), true`);
+  await sleep(250);
+  check('别的指针抬起不会打断正在录的语音',
+    (await A.eval(`document.getElementById('hold-talk').classList.contains('recording')`)) === true
+    && (await A.eval('__rt.holdWanted')) === true,
+    { recording: await A.eval('__rt.recording'), label: await A.eval(`document.getElementById('hold-label').textContent`) });
+
+  await sleep(1100);   // 累计按住约 2 秒
+  await A.eval(`window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 7 })), true`);
+  check('自己那根手指抬起来才算松手，并且这条语音发得出去',
+    await waitUntil(async () => (await A.eval('__rt.voiceCount')) > voiceAfterFirst, 'A 出现第二条语音气泡', 15000)
+      .then(() => true).catch(() => false));
+
+  // ③ 万一还是被系统收走（pointercancel）：录到的部分必须照样发出去，不许静默丢弃。
+  //    静默丢弃正是用户看到的「提示闪一下就断了，语音没发出去，也没个说法」。
+  const voiceAfterSecond = await A.eval('__rt.voiceCount');
+  await A.eval(`(() => {
+    document.getElementById('hold-talk').dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 8 }));
+    return true;
+  })()`);
+  await sleep(1200);
+  await A.eval(`window.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerId: 8 })), true`);
+  check('触摸被系统收走时，录到的那段照样发得出去（不再默默丢掉）',
+    await waitUntil(async () => (await A.eval('__rt.voiceCount')) > voiceAfterSecond, 'A 出现第三条语音气泡', 15000)
+      .then(() => true).catch(() => false));
+
+  // ④ 刚按下就松开（麦克风还没就绪）：按钮必须**立刻**回到待命，不许继续亮着红 ——
+  //    原来那种「红光一直亮到麦克风就绪才闪掉」正是用户描述的「闪现一下就断了」。
+  await A.eval(`(() => {
+    const h = document.getElementById('hold-talk');
+    h.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 9 }));
+    window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 9 }));
+    return true;
+  })()`);
+  await sleep(120);
+  check('刚按下就松开：按钮立刻回到「按住」（不会留一个假装在录的红按钮）',
+    (await A.eval(`document.getElementById('hold-label').textContent`)) === '按住'
+    && (await A.eval(`document.getElementById('hold-talk').classList.contains('recording')`)) === false
+    && (await A.eval('__rt.holdWanted')) === false,
+    await A.eval(`document.getElementById('hold-label').textContent`));
+  check('那一按也没把麦克风留在打开状态（不偷录）',
+    await waitUntil(async () => (await A.eval('__rt.recording')) === false, '录音收干净', 10000)
+      .then(() => true).catch(() => false));
+
   await A.click('btn-voice');
   check('能切回键盘模式', await A.eval('__rt.voiceMode') === false);
 

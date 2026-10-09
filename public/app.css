@@ -1015,12 +1015,24 @@ button { cursor: pointer; }
   font-size: 10.5px;
   line-height: 1;
   user-select: none;
-  touch-action: none;          /* 长按不能弹系统菜单、不能触发滚动 */
+  touch-action: none;          /* 长按不能弹系统菜单、不能触发滚动（子元素也要，见下） */
   -webkit-user-select: none;
   -webkit-touch-callout: none;
   transition: background .15s, border-color .15s, color .15s, transform .1s;
 }
 .hold-talk svg { width: 22px; height: 22px; display: block; }
+
+/* ⚠ touch-action 必须连子元素一起写。手指真正命中的是里面的 svg / span，而
+   touch-action **不是继承属性** —— 只写在按钮上，一部分实现按「命中元素自己
+   那一份」算，那这个 none 就白写了：浏览器照样能在长按时把这次触摸收走，
+   而「收走」= pointercancel = 正在录的语音当场断掉（手指明明还按着）。 */
+.hold-talk svg,
+.hold-talk span {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
 .hold-talk:active { transform: scale(.96); }
 .hold-talk.recording {
   background: var(--danger);

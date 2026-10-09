@@ -91,6 +91,10 @@ const XFER_HIGH = 1_000_000;        // 缓冲 > 1MB 就暂停，等降到 XFER_L
 const XFER_LOW = 256 * 1024;
 const XFER_MAX = 100 * 1024 * 1024; // 单文件上限 100MB；再大浏览器内存就吃不消了
 const VOICE_MAX_MS = 60_000;        // 单条语音最长 60 秒（和微信一个量级）
+// 「按住说话」：短于这个时长的一按，只当是误触/试探，不为它弹提示。
+// 判据必须用「松手时刻 - 按下时刻」，不能用「发现没录上时的时间」——
+// 麦克风就绪是异步的，后者会把一次 50ms 的轻点算成按了半秒。
+const HOLD_TAP_MS = 250;
 
 /** 相邻消息间隔超过这么久，就插一条居中的时间分隔（微信的做法）。 */
 const TIME_GAP_MS = 5 * 60_000;
@@ -354,12 +358,20 @@ const S = {
 
   /* ---- 语音消息 ---- */
   recorder: null,      // 正在进行的 MediaRecorder
+  recStarting: null,   // 正在申请的麦克风（两次按压挤在一起时共用，见 startRecord）
   recChunks: [],
   recStartedAt: 0,
   recTimer: null,      // 到点自动停
   recTimer2: null,     // 界面上的计时刷新
   voiceMode: false,    // 输入栏是否处于「按住说话」模式
   voiceHinted: false,  // 「按住说话」的操作提示只说一次
+  /* 「按住说话」的按压状态。放在 S 上而不是闭包里，是为了 __rt 能直接诊断 ——
+     手机上「按不住」这类问题在本地复现不了，只能靠这几个字段反推。 */
+  holdWanted: false,   // 手指还按着吗
+  holdPid: null,       // 正在跟哪一个 pointer（别人的指针事件不许打断录音）
+  holdAt: 0,           // 按下时刻（判断这一下算不算一次认真的按压）
+  holdEnd: 0,          // 松手时刻；和 holdAt 配对算按压时长，见 HOLD_TAP_MS
+  holdToken: 0,        // 第几次按压；后一次会把它之前那次作废
 
   /* ---- 文件 / 语音传输 ---- */
   rx: null,            // 正在接收的传输 { id, kind, name, mime, size, dur, chunks, got, el }
@@ -1468,59 +1480,71 @@ function showRecHud() {
  *
  * 用 pointerdown/pointerup 而不是 click：微信那种「按住录、松手发」必须同时知道
  * 按下和抬起两个时刻。pointer 事件一套代码同时覆盖鼠标、触摸、手写笔。
+ *
+ * ⚠ 这里要 await getUserMedia，手机上那是几百毫秒（第一次还要弹权限框）。这期间
+ *   用户完全可能已经松手、甚至又按了第二次，所以：
+ *   ① 一次申请只发一次（S.recStarting）—— 两次按压各申请一次会拿到两条麦克风流，
+ *      留下一个谁也停不掉的 MediaRecorder，表现是麦克风指示灯一直亮着；
+ *   ② 调用方拿到结果后必须再确认「这一轮还算数」（查 S.holdToken，见 boot 里那段）。
  */
 async function startRecord() {
   if (S.recorder) return;
-  if (!connected()) { toast('还没和对方接通'); return; }
-  if (!window.MediaRecorder) { toast('这台设备的浏览器不支持录音'); return; }
+  if (S.recStarting) return S.recStarting;
+  S.recStarting = (async () => {
+    if (!connected()) { toast('还没和对方接通'); return; }
+    if (!window.MediaRecorder) { toast('这台设备的浏览器不支持录音'); return; }
 
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-  } catch { toast('无法使用麦克风'); return; }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch { toast('无法使用麦克风'); return; }
 
-  const mime = pickAudioMime();
-  let rec;
-  try {
-    rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-  } catch {
-    try { rec = new MediaRecorder(stream); } catch { toast('这台设备不支持录音'); stream.getTracks().forEach((t) => t.stop()); return; }
-  }
-
-  S.recChunks = [];
-  S.recStartedAt = Date.now();
-  S.recorder = rec;
-  rec._cancelled = false;
-
-  rec.ondataavailable = (e) => { if (e.data && e.data.size) S.recChunks.push(e.data); };
-
-  rec.onstop = async () => {
-    const dur = Date.now() - S.recStartedAt;
-    for (const t of stream.getTracks()) { try { t.stop(); } catch { /* noop */ } }
-    clearInterval(S.recTimer2); S.recTimer2 = null;
-    S.recorder = null;
-    if (recEl) { recEl.remove(); recEl = null; }
-
-    const blob = new Blob(S.recChunks, { type: rec.mimeType || 'audio/webm' });
-    const cancelled = rec._cancelled;
-    S.recChunks = [];
-
-    if (cancelled || dur < 500 || blob.size < 600) {
-      if (!cancelled) toast('说话时间太短，已取消');
-      return;
+    const mime = pickAudioMime();
+    let rec;
+    try {
+      rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    } catch {
+      try { rec = new MediaRecorder(stream); } catch { toast('这台设备不支持录音'); stream.getTracks().forEach((t) => t.stop()); return; }
     }
-    const capped = Math.min(dur, VOICE_MAX_MS);
-    const el = addVoice(blob, 'me', capped);
-    if (await sendXfer('voice', blob, { mime: blob.type, dur: capped })) S.txCount++;
-    else { el.classList.add('failed'); toast('这条语音没发出去'); }
-  };
 
-  rec.start();
-  showRecHud();
-  // 到点自动停，免得一直占着麦克风
-  S.recTimer = setTimeout(() => stopRecord(), VOICE_MAX_MS);
+    S.recChunks = [];
+    S.recStartedAt = Date.now();
+    S.recorder = rec;
+    rec._cancelled = false;
+
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) S.recChunks.push(e.data); };
+
+    rec.onstop = async () => {
+      const dur = Date.now() - S.recStartedAt;
+      for (const t of stream.getTracks()) { try { t.stop(); } catch { /* noop */ } }
+      clearInterval(S.recTimer2); S.recTimer2 = null;
+      S.recorder = null;
+      if (recEl) { recEl.remove(); recEl = null; }
+
+      const blob = new Blob(S.recChunks, { type: rec.mimeType || 'audio/webm' });
+      const cancelled = rec._cancelled;
+      S.recChunks = [];
+
+      if (cancelled || dur < 500 || blob.size < 600) {
+        if (!cancelled) toast('说话时间太短，已取消');
+        return;
+      }
+      const capped = Math.min(dur, VOICE_MAX_MS);
+      const el = addVoice(blob, 'me', capped);
+      if (await sendXfer('voice', blob, { mime: blob.type, dur: capped })) S.txCount++;
+      else { el.classList.add('failed'); toast('这条语音没发出去'); }
+    };
+
+    rec.start();
+    // 按下这个手势已经结束了（用户松得比麦克风就绪还快）→ 别闪那个「录音中」浮层，
+    // 调用方马上会把它收掉；这里闪一下反而正是用户看到的「提示闪现一下就断了」。
+    if (S.holdWanted) showRecHud();
+    // 到点自动停，免得一直占着麦克风
+    S.recTimer = setTimeout(() => stopRecord(), VOICE_MAX_MS);
+  })();
+  try { await S.recStarting; } finally { S.recStarting = null; }
 }
 
 function stopRecord(cancel) {
@@ -1633,6 +1657,19 @@ function finishRx() {
 
 /* ---------------------------- 语音模式 / 发文件 ---------------------------- */
 
+/**
+ * 「按住说话」那颗按钮的两个态：红底「松开」= 正在录，灰底「按住」= 待命。
+ *
+ * 单独拎出来是因为切换语音/键盘模式时也要复位它 —— 切走时按钮已经被藏起来，
+ * 用户没有任何办法再「松开」它，必须由代码收尾。
+ */
+function setHoldUI(on) {
+  const b = $('hold-talk');
+  if (b) b.classList.toggle('recording', on);
+  const label = $('hold-label');
+  if (label) label.textContent = on ? '松开' : '按住';
+}
+
 function setVoiceMode(on) {
   S.voiceMode = on;
   $('btn-voice').classList.toggle('on', on);
@@ -1644,8 +1681,18 @@ function setVoiceMode(on) {
   // .voice 一挂上，那颗话筒就从长条变成居中的大圆（见 app.css）——
   // 手机上长条按不住，圆形落点稳得多
   $('composer').classList.toggle('voice', on);
-  if (!on) $('text').focus();
-  else if (!S.voiceHinted) {
+  if (!on) {
+    // 切回键盘时如果还按着 / 还在录，收干净：那颗按钮马上就被藏起来，
+    // 用户没有机会松手了，只能等 60 秒上限 —— 那就是在偷录。
+    if (S.holdWanted || S.recorder) {
+      S.holdWanted = false;
+      S.holdPid = null;
+      S.holdEnd = Date.now();
+      stopRecord(true);
+    }
+    setHoldUI(false);
+    $('text').focus();
+  } else if (!S.voiceHinted) {
     S.voiceHinted = true;
     toast('按住圆形按钮说话，松手发送', 3200);
   }
@@ -2748,8 +2795,15 @@ window.__rt = {
     if (!el || el.hidden) return null;
     const r = el.getBoundingClientRect();
     return { w: Math.round(r.width), h: Math.round(r.height),
-             radius: getComputedStyle(el).borderRadius };
+             radius: getComputedStyle(el).borderRadius,
+             // 「按不住」那类问题，一半出在这里：touch-action 必须是 none，
+             // 而且命中的子元素也得是 none（见 app.css 里那条说明）
+             touchAction: getComputedStyle(el).touchAction };
   },
+  /** 录音状态：按住说话排障用（手指按着 / 跟的是哪个指针 / 麦克风就绪没） */
+  get recording() { return !!S.recorder; },
+  get holdWanted() { return S.holdWanted; },
+  get holdPid() { return S.holdPid; },
   get localTag() { return $('tag-local').textContent; },
   get remoteTag() { return $('tag-remote').textContent; },
   get facing() { return S.facing; },
@@ -2834,56 +2888,97 @@ function boot() {
 
   $('btn-voice').addEventListener('click', () => setVoiceMode(!S.voiceMode));
 
-  // 按住说话：pointerdown 起录、pointerup 停。
-  // pointerup/pointercancel 挂在 window 而不是按钮上 —— 手指按住后划出按钮范围
-  // 再松开时，按钮收不到 pointerup，录音就会一直挂着。
+  // 按住说话：pointerdown 起录、松手发。
+  //
+  // 手机上「按不住」有三条真实来路，这里逐条堵：
+  //
+  // ① 浏览器把这次触摸收走 → 发 pointercancel，录音当场断掉，而手指还按着，
+  //    用户只觉得「它自己断了」。触发条件（MDN 明确列了）包括：这次触摸被判成
+  //    滚动 / 缩放、**同时触点过多**（单手拿手机时拇指按屏幕、掌根贴屏就是这种
+  //    情况，浏览器会给所有在按的指针都发 cancel）、系统切换应用、屏幕旋转。
+  //    对策：touch-action:none + 在这一颗按钮上拦掉 touchstart / touchmove 的默认
+  //    动作，让浏览器在这块地盘上没有可执行的默认动作可做。
+  //    ⚠ touch-action 必须连子元素一起写（见 app.css）：真正被手指命中的是里面的
+  //      svg / span，只写在按钮上，一部分实现不认。
+  //
+  // ② 手指按住后划出按钮范围，按钮就收不到 pointerup 了。原来靠「把 pointerup 挂到
+  //    window 上」解决，但那等于**任何**一次指针抬起都会打断录音（另一根手指、
+  //    鼠标兼容事件、别处的点击）—— 手机上一次误触就能把正在说的话掐掉。
+  //    对策：pointerdown 时 setPointerCapture，让这个指针的事件一定回到按钮；
+  //    再按 pointerId 过滤，别人的指针一律不理。
+  //
+  // ③ 申请麦克风是异步的（手机上几百毫秒），这期间松手的话，原实现会在麦克风就绪
+  //    之后**静默丢弃**：用户看到的是「按住 → 提示闪一下 → 没了，也没个说法」。
+  //    现在立刻恢复按钮状态，并说清楚为什么没录上。
   const hold = $('hold-talk');
-  const holdLabel = $('hold-label');
-  const setHoldLabel = (t) => { if (holdLabel) holdLabel.textContent = t; };
-  let holdWanted = false;   // 手指还按着吗
 
-  // 长按弹系统菜单（iOS 会选中文字、Android 会弹「复制链接」）会打断按住不放，
-  // 这是「按不住」最常见的另一半原因
+  // 长按弹系统菜单（iOS 选中文字、Android 弹「复制链接」）会打断按住不放
   hold.addEventListener('contextmenu', (ev) => ev.preventDefault());
+  hold.addEventListener('dragstart', (ev) => ev.preventDefault());   // 长按拖拽同样会打断
+  for (const type of ['touchstart', 'touchmove']) {
+    // ⚠ 必须显式 passive:false —— 这两个事件默认是 passive 的，那样
+    //   preventDefault() 会被直接忽略，浏览器照旧执行默认动作。
+    hold.addEventListener(type, (ev) => ev.preventDefault(), { passive: false });
+  }
+
+  /**
+   * 结束这一轮按压。正常松手要发出去，被动中断也算「松手」（录到的部分照样发）。
+   *
+   * 必须幂等：一次松手可能来两个收尾事件（pointerup 与紧随其后的 pointercancel），
+   * 不能因此把下一段录音顺手停掉。
+   */
+  const finishHold = () => {
+    if (!S.holdWanted) return;
+    S.holdWanted = false;
+    S.holdPid = null;
+    S.holdEnd = Date.now();
+    setHoldUI(false);
+    if (!S.recorder) return;   // 麦克风还没就绪 —— 交给 pointerdown 里 await 之后收尾
+    stopRecord();
+  };
+
+  /** 这次事件是不是「按着的那根手指」发出来的（见 ②） */
+  const mineEnd = (ev) => S.holdPid !== null && ev.pointerId === S.holdPid;
 
   hold.addEventListener('pointerdown', async (ev) => {
     ev.preventDefault();
-    if (holdWanted) return;
-    holdWanted = true;
-    hold.classList.add('recording');
-    setHoldLabel('松开');
+    if (S.holdWanted) return;          // 已经在跟一根手指了，别开第二轮
+    S.holdWanted = true;
+    S.holdPid = ev.pointerId;
+    S.holdAt = Date.now();
+    const token = ++S.holdToken;       // 后一次按压会让这一轮作废
+    setHoldUI(true);
 
-    await startRecord();     // 申请麦克风是异步的，这期间用户可能已经松手了
+    // 划出按钮范围也照样收得到 pointerup（见 ②）。
+    // 合成事件（测试里用）没有真实指针，会抛 NotFoundError，忽略即可。
+    try { hold.setPointerCapture(ev.pointerId); } catch { /* 没有这个指针 */ }
 
-    if (!S.recorder) {       // 起录失败（没权限 / 不支持）
-      holdWanted = false;
-      hold.classList.remove('recording');
-      setHoldLabel('按住');
+    await startRecord();               // 申请麦克风是异步的，这期间用户可能已经松手
+
+    if (token !== S.holdToken) return; // 已被后一次按压接管，收尾归它
+    if (!S.recorder) {                 // 起录失败（没连上 / 没权限 / 不支持），提示已给过
+      S.holdWanted = false;
+      S.holdPid = null;
+      setHoldUI(false);
       return;
     }
-    // 松手发生在麦克风就绪之前 → 这条本来就没打算录，直接丢弃。
-    // 不处理的话，录音会一直挂到 60 秒上限才停，用户会觉得「按一下就开始偷录」。
-    if (!holdWanted) {
+    if (!S.holdWanted) {
+      // 松手（或这次触摸被浏览器收走）发生在麦克风就绪之前：这一段什么都没录到，
+      // 只能丢弃。但要说清楚 —— 静默丢弃正是「按了没反应」的最大来源。
+      // 太短的一按（轻点试探）不提示，否则每点一下弹一句会很吵。
       stopRecord(true);
-      hold.classList.remove('recording');
-      setHoldLabel('按住');
+      if (S.holdEnd - S.holdAt >= HOLD_TAP_MS) toast('麦克风还在准备，按住稍等一秒再说话');
     }
   });
 
-  const endHold = () => {
-    holdWanted = false;
-    if (!S.recorder) return;
-    hold.classList.remove('recording');
-    setHoldLabel('按住');
-    stopRecord();
-  };
-  window.addEventListener('pointerup', endHold);
-  window.addEventListener('pointercancel', () => {
-    holdWanted = false;
-    if (!S.recorder) return;
-    hold.classList.remove('recording');
-    setHoldLabel('按住');
-    stopRecord(true);
+  window.addEventListener('pointerup', (ev) => { if (mineEnd(ev)) finishHold(); });
+  // 被浏览器收走（判成滚动 / 缩放 / 触点过多）时，这次手势已经结束，但手指多半还按着。
+  // 已录到的部分照样发出去 —— 发了总比默默丢掉强，用户至少看得见自己说了什么。
+  window.addEventListener('pointercancel', (ev) => {
+    if (!mineEnd(ev)) return;
+    const mid = S.recorder && Date.now() - S.recStartedAt >= 500;
+    finishHold();
+    if (mid) toast('录音被系统打断了，已把录到的部分发出去');
   });
 
   $('btn-attach').addEventListener('click', () => $('file-input').click());
