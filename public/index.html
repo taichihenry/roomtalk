@@ -9,13 +9,13 @@
 <meta name="description" content="和对方约定一串口令，输入即接通。文字、语音、视频点对点直达，服务器不经手、不存储。">
 <title>暗号 · 口令通话</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Cpath d='M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z' fill='%23fff' opacity='.92'/%3E%3Ccircle cx='43' cy='24' r='7' fill='none' stroke='%23fff' stroke-width='3.4'/%3E%3Cpath d='M43 31v6' stroke='%23fff' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="app.css?v=20261008b">
+<link rel="stylesheet" href="app.css?v=20261009b">
 <!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求。
      ⚠ preload 的 href 必须和下面 <script> 的 src **逐字一致（含 ?v=）**，
        否则等于白下两份。
      ⚠ 改了 app.js / app.css，就把这个 ?v= 一起改掉（随意换个值即可）：
        URL 一变缓存立刻失效，用户永远不会拿到「新页面 + 旧脚本」的混搭。 -->
-<link rel="preload" href="app.js?v=20261008b" as="script">
+<link rel="preload" href="app.js?v=20261009b" as="script">
 </head>
 <body>
 
@@ -79,6 +79,9 @@
 
 <!-- ============================ 房间 ============================ -->
 <main id="room" class="room" hidden>
+  <!-- 顶栏刻意保持极简：只留「连接状态 / 我发出的画质 / 离开房间」。
+       麦克风与摄像头开关**不在这里** —— 它们在通话界面里（通话中才用得上），
+       而「发起通话」在下方输入栏旁边。同一个动作只留一个入口。 -->
   <header class="bar">
     <button id="dot" class="dot" type="button" aria-label="连接状态"></button>
     <span id="status" class="status">正在连接…</span>
@@ -91,13 +94,9 @@
         <option value="smooth">流畅</option>
         <option value="sharp">清晰</option>
       </select>
-      <button id="btn-mic" class="icon" type="button" title="语音" aria-label="语音" aria-pressed="false">🎙</button>
-      <button id="btn-cam" class="icon" type="button" title="视频" aria-label="视频" aria-pressed="false">📷</button>
-      <!-- 切换前后摄像头。默认藏起来：只有探到设备上真有 >= 2 颗摄像头才露
-           （见 app.js 的 refreshCamCount），桌面单摄笔记本上没它什么事。 -->
-      <button id="btn-flip" class="icon" type="button" title="切换前后摄像头"
-              aria-label="切换前后摄像头" hidden>🔄</button>
-      <button id="btn-hangup" class="icon danger" type="button" title="退出" aria-label="退出">✕</button>
+      <button id="btn-hangup" class="icon" type="button" title="离开房间" aria-label="离开房间">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
     </div>
   </header>
 
@@ -121,15 +120,13 @@
   <div id="trust" class="trust" hidden>
     <span id="trust-text" class="trust-text"></span>
     <span class="trust-actions">
-      <button id="trust-keep" type="button" class="mini" hidden>记住这台</button>
+      <button id="trust-keep" type="button" class="mini" hidden>记住这台设备</button>
       <button id="trust-kick" type="button" class="mini danger" hidden>请出房间</button>
     </span>
   </div>
 
-  <!-- 视频舞台：**默认两块窗口等分**（横屏左右、竖屏上下），尺寸完全一致 ——
-       不要做成默认「对方铺满 + 自己小窗」，那会让两端显示比例差太多。
-       但默认之外要留一条出路：用户点某一格，那一格铺满、另一格缩成右上角小窗
-       （微信的做法，见 app.css 的 .stage.pip）。点哪格哪格放大，再点另一格就换回来。 -->
+  <!-- 视频舞台。只在**视频通话**里显示，由 app.js 的 syncStage 决定显隐。
+       全屏通话时铺满整块屏幕（见 .room.call-mode .stage）。 -->
   <div id="stage" class="stage" hidden>
     <div class="pane" id="pane-remote" data-slot="remote"
          role="button" tabindex="0" aria-label="点按放大对方的画面">
@@ -147,6 +144,49 @@
     </div>
   </div>
 
+  <!-- ===================== 通话界面（全屏，参考微信） =====================
+       通话中铺满整块屏幕：上方是对方设备名与通话时长，右下角是挂断/静音/翻转。
+       视频通话时舞台铺满，双方画面**一方铺满、一方缩成右上角小窗**，点小窗互换。
+
+       为什么做全屏而不只是「放大一个窗口」：全屏这一态顺手把聊天输入栏收了起来，
+       于是「已经在通话了，又去点发起通话」这件事从界面上就不成立了。 -->
+  <div id="call-ui" class="call-ui" hidden>
+    <div class="call-head">
+      <div class="call-peer" id="call-peer">对方</div>
+      <div class="call-sub">
+        <span id="call-state">通话中</span>
+        <span id="call-timer" class="call-timer"></span>
+      </div>
+    </div>
+
+    <!-- 语音通话（或视频通话里双方都没开画面）时的占位视图 -->
+    <div class="call-audio" id="call-audio" hidden>
+      <div class="call-avatar" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6.3 3.5h2.6l1.6 4.1-2.1 1.5a12.6 12.6 0 0 0 5.5 5.5l1.5-2.1 4.1 1.6v2.6a2.1 2.1 0 0 1-2.3 2.1A17 17 0 0 1 4.2 5.8 2.1 2.1 0 0 1 6.3 3.5Z"/></svg>
+      </div>
+      <p class="call-audio-hint">语音通话中</p>
+    </div>
+
+    <div class="call-actions">
+      <button id="btn-mic" class="cbtn round" type="button" title="麦克风" aria-label="麦克风" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/><path d="M8.5 21h7"/></svg>
+      </button>
+      <button id="btn-cam" class="cbtn round" type="button" title="摄像头" aria-label="摄像头" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6" width="12.6" height="12" rx="2.8"/><path d="M15.1 11.3 20 8.5a.8.8 0 0 1 1.2.7v5.6a.8.8 0 0 1-1.2.7l-4.9-2.8Z"/></svg>
+      </button>
+      <!-- 切换前后摄像头。只有**探到设备上真有 >= 2 颗摄像头**、且正处于视频通话
+           时才露（见 app.js 的 refreshCamCount），桌面单摄笔记本上没它什么事。 -->
+      <button id="btn-flip" class="cbtn round" type="button" title="切换前后摄像头"
+              aria-label="切换前后摄像头" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9.4a8 8 0 0 1 13.4-3.1L20 8.8"/><path d="M20 4.4v4.4h-4.4"/><path d="M20 14.6a8 8 0 0 1-13.4 3.1L4 15.2"/><path d="M4 19.6v-4.4h4.4"/></svg>
+      </button>
+      <button id="btn-hangup-call" class="cbtn round hangup" type="button" title="挂断通话"
+              aria-label="挂断通话">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.3 3.5h2.6l1.6 4.1-2.1 1.5a12.6 12.6 0 0 0 5.5 5.5l1.5-2.1 4.1 1.6v2.6a2.1 2.1 0 0 1-2.3 2.1A17 17 0 0 1 4.2 5.8 2.1 2.1 0 0 1 6.3 3.5Z"/></svg>
+      </button>
+    </div>
+  </div>
+
   <!-- 声音解锁兜底：浏览器（尤其 iOS）会拦掉「非用户手势触发」的音频播放。
        被拦时视频照常、就是没声音 —— 用户只会觉得「听不到对方」。
        所以给一条显眼的、点一下就好的出口，而不是静默失败。 -->
@@ -159,7 +199,10 @@
        也顺手解决了自动播放需要用户手势的问题。 -->
   <div id="ring" class="ring" hidden>
     <div class="ring-card">
-      <div class="ring-avatar" id="ring-avatar">📞</div>
+      <div class="ring-avatar" id="ring-avatar">
+        <svg class="i-audio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.3 3.5h2.6l1.6 4.1-2.1 1.5a12.6 12.6 0 0 0 5.5 5.5l1.5-2.1 4.1 1.6v2.6a2.1 2.1 0 0 1-2.3 2.1A17 17 0 0 1 4.2 5.8 2.1 2.1 0 0 1 6.3 3.5Z"/></svg>
+        <svg class="i-video" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6" width="12.6" height="12" rx="2.8"/><path d="M15.1 11.3 20 8.5a.8.8 0 0 1 1.2.7v5.6a.8.8 0 0 1-1.2.7l-4.9-2.8Z"/></svg>
+      </div>
       <p class="ring-title" id="ring-title">对方想和你通话</p>
       <p class="ring-sub" id="ring-sub">接听后才会打开你的麦克风</p>
       <div class="ring-actions">
@@ -172,16 +215,29 @@
   <div id="log" class="log" role="log" aria-live="polite"></div>
 
   <!-- 输入栏（参考微信的结构）：切换语音 / 附件 / 文字 / 发起通话。
-       通话入口放在这里而不是只藏在顶栏 —— 顶栏那两个是「通话中调麦调镜头」，
-       这里才是「发起」。 -->
+       通话入口放在这里而不是顶栏 —— 顶栏不放假控件，这一排才是「发起」的地方。 -->
   <form id="composer" class="composer" autocomplete="off">
-    <button id="btn-voice" class="cbtn" type="button" title="切换到语音" aria-label="切换到语音" aria-pressed="false">🎙</button>
-    <button id="btn-attach" class="cbtn" type="button" title="发送文件" aria-label="发送文件">📎</button>
+    <button id="btn-voice" class="cbtn" type="button" title="切换到语音" aria-label="切换到语音" aria-pressed="false">
+      <svg class="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/><path d="M8.5 21h7"/></svg>
+      <svg class="i-kbd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5.5" width="20" height="13" rx="2.5"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7.5 14h9"/></svg>
+    </button>
+    <button id="btn-attach" class="cbtn" type="button" title="发送文件" aria-label="发送文件">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 11.6 12.3 19.8a5.2 5.2 0 0 1-7.4-7.4l8.2-8.2a3.5 3.5 0 0 1 4.9 4.9l-8.2 8.2a1.7 1.7 0 0 1-2.5-2.5l7.6-7.6"/></svg>
+    </button>
     <input id="text" type="text" placeholder="输入消息…" autocomplete="off"
            maxlength="2000" enterkeyhint="send" aria-label="消息内容">
-    <button id="hold-talk" class="hold-talk" type="button" hidden>按住 说话</button>
-    <button id="btn-call-audio" class="cbtn call" type="button" title="发起语音通话" aria-label="发起语音通话">📞</button>
-    <button id="btn-call-video" class="cbtn call" type="button" title="发起视频通话" aria-label="发起视频通话">📹</button>
+    <!-- 语音模式下的「按住说话」。默认收成一个居中的大圆按钮（手机上拇指够得着、
+           按得住），按下后变成红色并在浮层里显示时长。 -->
+    <button id="hold-talk" class="hold-talk" type="button" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/><path d="M8.5 21h7"/></svg>
+      <span id="hold-label" class="hold-label">按住</span>
+    </button>
+    <button id="btn-call-audio" class="cbtn call" type="button" title="发起语音通话" aria-label="发起语音通话">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.3 3.5h2.6l1.6 4.1-2.1 1.5a12.6 12.6 0 0 0 5.5 5.5l1.5-2.1 4.1 1.6v2.6a2.1 2.1 0 0 1-2.3 2.1A17 17 0 0 1 4.2 5.8 2.1 2.1 0 0 1 6.3 3.5Z"/></svg>
+    </button>
+    <button id="btn-call-video" class="cbtn call" type="button" title="发起视频通话" aria-label="发起视频通话">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6" width="12.6" height="12" rx="2.8"/><path d="M15.1 11.3 20 8.5a.8.8 0 0 1 1.2.7v5.6a.8.8 0 0 1-1.2.7l-4.9-2.8Z"/></svg>
+    </button>
     <button type="submit" id="btn-send" class="primary" disabled>发送</button>
   </form>
   <input id="file-input" type="file" multiple hidden>
@@ -189,6 +245,6 @@
 
 <div id="toast" class="toast" hidden role="status"></div>
 
-<script src="app.js?v=20261008b"></script>
+<script src="app.js?v=20261009b"></script>
 </body>
 </html>

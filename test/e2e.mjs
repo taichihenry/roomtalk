@@ -287,7 +287,17 @@ async function main() {
   // 身份核对：纯口令没法证明「你是这个人」，所以必须如实告诉用户这是第一次
   await waitUntil(async () => A.eval('__rt.trustShown'), 'A 收到身份提示', 12000);
   check('首次通话被明确标注为「第一次」（不假装已经认证过）',
-    (await A.eval('__rt.trustClass')).includes('new'), await A.eval('__rt.trustClass'));
+    (await A.eval('__rt.trustClass')).includes('first'), await A.eval('__rt.trustClass'));
+  // ⚠ 首访**绝不能自动记住**：口令谁先拿到谁先进，自动信任等于把「先到的那个
+  //   陌生人」永久写成「已确认」，真正的对方反而成了「设备换过」的可疑对象。
+  //   所以第一次只报告事实，要不要收下由用户点一下。
+  check('第一次进来时并没有被自动记为「已确认」',
+    !(await A.eval('__rt.trustClass')).includes('ok')
+    && await A.eval('__rt.trustKeepShown') === true,
+    { cls: await A.eval('__rt.trustClass'), keep: await A.eval('__rt.trustKeepShown') });
+  await A.click('trust-keep');
+  check('用户点「记住这台设备」之后，提示条的标题才变成「已确认」',
+    (await A.eval('__rt.trustClass')).includes('ok'), await A.eval('__rt.trustClass'));
   check('双方交换到了对方的设备标识',
     !!(await A.eval('__rt.peerDeviceId')) && !!(await B.eval('__rt.peerDeviceId')));
   check('两端设备标识不同', await A.eval('__rt.peerDeviceId') !== await B.eval('__rt.peerDeviceId'));
@@ -319,21 +329,62 @@ async function main() {
     aMsgs.find((m) => m.text.startsWith('收到了'))?.who === 'them', aMsgs);
 
   /* ---------------------------- 3. 通话 ---------------------------- */
-  section('3. 语音与视频');
+  section('3. 视频通话：发起 → 对方接听 → 全屏通话界面');
 
-  await A.click('btn-cam');
+  // 顶栏刻意不再放麦克风/摄像头的开关（两个「发起通话」入口已经覆盖了这件事），
+  // 所以这里先钉住「顶栏是干净的」，再用真实路径打通一次通话。
+  check('顶栏不再放麦克风 / 摄像头 / 翻转的开关按钮',
+    await A.eval('!document.querySelector(".bar #btn-mic, .bar #btn-cam, .bar #btn-flip") === true'));
+  check('输入栏里有发起语音 / 视频通话的入口',
+    await A.eval('!!document.getElementById("btn-call-audio") && !!document.getElementById("btn-call-video")'));
+
+  await A.click('btn-call-video');
+  await waitUntil(async () => (await A.eval('__rt.callUiShown')) === true, 'A 进入通话界面', 12000);
+  check('发起方立刻铺开全屏通话界面', await A.eval('__rt.callMode') === true);
+  check('呼叫中：状态写明「正在呼叫」，时长先不显示',
+    await A.eval('__rt.callRinging') === true
+    && (await A.eval('__rt.callStateText')).includes('呼叫'), await A.eval('__rt.callStateText'));
+  check('通话界面里聊天输入栏被收起（从这里就点不到「发起通话」了）',
+    await A.eval('__rt.composerHidden') === true);
+  check('通话界面上有挂断按钮', await A.eval('!!document.getElementById("btn-hangup-call")'));
+  // 互斥的第二道保险：界面之外（脚本 / 无障碍工具）再点一次发起也进不去
+  await A.click('btn-call-audio');
+  check('正在呼叫时再点另一颗发起按钮也无效（不会串成第二通电话）',
+    await A.eval('__rt.callKind') === 'video', await A.eval('__rt.callKind'));
+
+  await waitUntil(async () => await B.eval('__rt.ringShown'), 'B 弹出通话请求', 12000)
+    .then(() => check('发起方一按，对方就收到通话请求', true))
+    .catch(async () => check('发起方一按，对方就收到通话请求', false, await B.eval('__rt.ringShown')));
+  check('来电浮层说明了是哪一种通话',
+    /视频/.test(await B.eval('document.getElementById("ring-title").textContent')),
+    await B.eval('document.getElementById("ring-title").textContent'));
+
+  await B.click('ring-accept');
+  check('接听后浮层收起', await B.eval('__rt.ringShown') === false);
+  // ⚠ 接听是异步的（要等 getUserMedia），click() 一返回就断言会拿到旧值 —— 必须等
+  check('接听这个动作本身就打开了对方的麦克风（不依赖再去点别处）',
+    await waitUntil(async () => (await B.eval('__rt.media.audio')) === true, 'B 麦克风就绪', 20000)
+      .then(() => true).catch(() => false), await B.eval('__rt.media'));
+  check('视频通话接听后对方摄像头也开了',
+    await waitUntil(async () => (await B.eval('__rt.media.video')) === true, 'B 摄像头就绪', 25000)
+      .then(() => true).catch(() => false), await B.eval('__rt.media'));
+  check('接听方也铺开了全屏通话界面', await B.eval('__rt.callMode') === true);
+  check('两端都进入通话态', await A.eval('__rt.inCall') === true && await B.eval('__rt.inCall') === true);
+  check('接通后开始计时', /^\d\d:\d\d$/.test(await A.eval('__rt.callTimerText')),
+    await A.eval('__rt.callTimerText'));
+  check('通话界面上写着对方是谁', (await A.eval('__rt.callPeerText')).length > 0,
+    await A.eval('__rt.callPeerText'));
+
   await waitUntil(async () => (await B.eval('__rt.remoteVideoTracks')) > 0, 'B 收到 A 的视频轨道', 25000);
   check('A 开摄像头 → B 收到视频轨道', true);
   check('B 侧界面显示视频区', await B.eval('!document.getElementById("stage").hidden'));
   check('B 侧标记「对方已开摄像头」', await B.eval('__rt.remoteMedia.video === true'));
-
-  await B.click('btn-mic');
-  await waitUntil(async () => (await A.eval('__rt.remoteAudioTracks')) > 0, 'A 收到 B 的音频轨道', 25000);
-  check('B 开麦克风 → A 收到音频轨道', true);
+  await waitUntil(async () => (await A.eval('__rt.remoteVideoTracks')) > 0, 'A 收到 B 的视频轨道', 25000);
+  check('B 开摄像头 → A 收到视频轨道（双向视频）', true);
   check('A 侧标记「对方已开麦克风」', await A.eval('__rt.remoteMedia.audio === true'));
-
-  check('双向媒体共存（A 出视频、B 出音频）',
-    (await B.eval('__rt.remoteVideoTracks')) > 0 && (await A.eval('__rt.remoteAudioTracks')) > 0);
+  check('双向媒体共存', (await B.eval('__rt.remoteVideoTracks')) > 0
+    && (await A.eval('__rt.remoteVideoTracks')) > 0);
+  check('远端声音没有被自动播放策略挡住', await B.eval('__rt.audioBlocked') === false);
 
   /* --- 码率与降级偏好：决定「弱网下是掉画质还是掉流畅」的两个参数 --- */
   const vs = await A.eval('__rt.videoStats()');
@@ -424,7 +475,10 @@ async function main() {
 
   await A.click('btn-cam');
   await waitUntil(async () => (await A.eval('__rt.media.video')) === false, 'A 关闭摄像头');
-  check('关摄像头后本端状态同步', await A.eval('__rt.media.video') === false);
+  check('通话中关掉自己的摄像头：本端状态同步',
+    await A.eval('__rt.media.video') === false);
+  check('通话中关掉摄像头**不会**把通话也结束掉（只是这路视频没了）',
+    await A.eval('__rt.callKind') === 'video', await A.eval('__rt.callKind'));
   check('关摄像头后向对端广播了新状态', await waitUntil(async () => (await B.eval('__rt.remoteMedia.video')) === false, 'B 收到关闭状态', 8000).then(() => true).catch(() => false));
 
   /* ---------------------------- 4. 第三个人 ---------------------------- */
@@ -457,10 +511,11 @@ async function main() {
   /* ---------------------------- 5. 断线重连 ---------------------------- */
   section('5. 掉线后自动重连并恢复通话');
 
-  // 先在 A 上开着麦克风：重连后它必须自动接回新连接（这一步最容易漏）
-  await A.click('btn-mic');
-  await waitUntil(async () => (await A.eval('__rt.media.audio')) === true, 'A 打开麦克风', 15000);
-  check('重连前 A 正开着麦克风', true);
+  // A 这会儿正处在前一节那通视频通话里（麦克风开着）：重连后它必须自动接回新连接
+  // （这一步最容易漏 —— 媒体流挂在 S.localStream 上，靠 buildPeerConnection 重新 addTrack）
+  check('重连前 A 正在通话中、麦克风开着',
+    await A.eval('__rt.inCall') === true && await A.eval('__rt.media.audio') === true,
+    { kind: await A.eval('__rt.callKind'), media: await A.eval('__rt.media') });
 
   // 掐掉 B 的信令连接，模拟网络抖动 / 切基站
   await B.eval('window.__rt.__dropSocket(), true');
@@ -480,15 +535,34 @@ async function main() {
     .catch(async () => check('重连后 DataChannel 真正 open（不只是 PC 通了）', false,
       await B.eval('__rt.dcOpen')));
 
-  await B.type('重连之后我还在');
-  check('重连后消息通道恢复', await waitUntil(
-    async () => (await A.eval('__rt.messages')).some((m) => m.text === '重连之后我还在'),
-    '重连后的消息', 20000,
-  ).then(() => true).catch(() => false));
+  check('通话在重连后没有被打断（不会因为掉一次线就把人踢出通话界面）',
+    await A.eval('__rt.inCall') === true && await B.eval('__rt.inCall') === true,
+    { a: await A.eval('__rt.callKind'), b: await B.eval('__rt.callKind') });
 
   check('重连后麦克风自动接回新连接（否则对方会突然听不见）', await waitUntil(
     async () => (await B.eval('__rt.remoteAudioTracks')) > 0,
     '重连后重新收到音频轨道', 25000,
+  ).then(() => true).catch(() => false));
+
+  // 挂断，回到聊天态 —— 后面几节（请人出去、发语音、发文件）都是聊天态的事
+  await A.click('btn-hangup-call');
+  await waitUntil(async () => (await A.eval('__rt.inCall')) === false
+    && (await B.eval('__rt.inCall')) === false, '两端都退出通话', 20000)
+    .then(() => check('挂断后双方都退出全屏通话界面', true))
+    .catch(async () => check('挂断后双方都退出全屏通话界面', false,
+      { a: await A.eval('__rt.callKind'), b: await B.eval('__rt.callKind') }));
+  check('挂断后输入栏回来了（可以继续聊天）', await A.eval('__rt.composerHidden') === false);
+  check('挂断后本地麦克风/摄像头都关掉（设备指示灯必须灭）',
+    await A.eval('__rt.media.audio === false && __rt.media.video === false'),
+    await A.eval('__rt.media'));
+  check('对方那端也一并收掉了媒体（不会留下一个单向亮着的摄像头）',
+    await B.eval('__rt.media.audio === false && __rt.media.video === false'),
+    await B.eval('__rt.media'));
+
+  await B.type('重连之后我还在');
+  check('重连后消息通道恢复', await waitUntil(
+    async () => (await A.eval('__rt.messages')).some((m) => m.text === '重连之后我还在'),
+    '重连后的消息', 20000,
   ).then(() => true).catch(() => false));
 
   /* ---------------------------- 6. 请出房间 ---------------------------- */
@@ -571,13 +645,11 @@ async function main() {
   check('开关能再开回来（不是单向的）', await A.eval('__rt.autoKick') === true);
 
   /* ---------------------------- 8. 通话入口与音视频布局 ---------------------------- */
-  section('8. 发起通话 / 等分视频区 / 语音消息 / 发文件');
+  section('8. 发起通话 / 全屏视频区 / 语音消息 / 发文件');
 
-  // --- 8a. 「发起视频通话」→ 对方接听 ---
-  // 开麦必须由使用者自己点（浏览器不允许无手势采集），所以设计成呼叫-接听，
-  // 而不是「我一按两边一起开」。这里验证这条链路真的走得通。
-  check('输入栏里有发起语音/视频通话的入口',
-    await A.eval('!!document.getElementById("btn-call-audio") && !!document.getElementById("btn-call-video")'));
+  // --- 8a. 「发起视频通话」→ 对方接听（第 3 节已走过一遍，这里再走一次，
+  //     顺便把「通话中不能重复发起」这条互斥规则钉死）---
+  check('此刻不在通话中（上一通已经挂断）', await A.eval('__rt.inCall') === false);
 
   await A.click('btn-call-video');
   await waitUntil(async () => await B.eval('__rt.ringShown'), 'B 弹出通话请求', 12000)
@@ -586,6 +658,11 @@ async function main() {
   check('来电浮层说明了是哪一种通话',
     /视频/.test(await B.eval('document.getElementById("ring-title").textContent')),
     await B.eval('document.getElementById("ring-title").textContent'));
+
+  // 对方还没接：这时发起方已经占着通话态，再点另一颗发起按钮也不该起作用
+  await A.click('btn-call-audio');
+  check('呼叫未接时再点发起无效（通话态是互斥的）',
+    await A.eval('__rt.callKind') === 'video', await A.eval('__rt.callKind'));
 
   await B.click('ring-accept');
   check('接听后浮层收起', await B.eval('__rt.ringShown') === false);
@@ -601,38 +678,47 @@ async function main() {
   ).then(() => true).catch(() => false));
   check('远端声音没有被自动播放策略挡住', await B.eval('__rt.audioBlocked') === false);
 
-  // --- 8b. 视频区：两块窗口必须一样大，且不裁切 ---
+  // --- 8b. 视频区 = 全屏舞台 + 微信式的「一大一小」---
+  // 用户要的就是微信那个样子：一方铺满整屏，另一方缩在右上角的小窗里。
+  // ⚠ 自动摆位要等对方的 media 状态经 DataChannel 到达，不能点完就断言
+  await waitUntil(async () => (await A.eval('__rt.stageMain')) === 'remote',
+    '画面自动切成「对方大」', 12000)
+    .then(() => check('视频通话默认把对方放成大的那格', true))
+    .catch(async () => check('视频通话默认把对方放成大的那格', false,
+      { main: await A.eval('__rt.stageMain'), remoteMedia: await A.eval('__rt.remoteMedia') }));
+  check('默认就带放大状态（.pip），我这一格缩成右上角小窗',
+    await A.eval('__rt.stagePip') === true
+    && JSON.stringify(await A.eval('__rt.smallPane')) === '["local"]',
+    { pip: await A.eval('__rt.stagePip'), small: await A.eval('__rt.smallPane') });
+  check('视频通话时舞台铺满整个屏幕（全屏通话，而不是嵌在聊天里的一条）',
+    await A.eval(`(() => {
+      const s = document.getElementById('stage').getBoundingClientRect();
+      const w = document.documentElement.clientWidth;
+      const h = document.documentElement.clientHeight;
+      return Math.abs(s.width - w) < 2 && Math.abs(s.height - h) < 2;
+    })()`), await A.eval(`(() => {
+      const s = document.getElementById('stage').getBoundingClientRect();
+      return { w: Math.round(s.width), h: Math.round(s.height),
+               vw: document.documentElement.clientWidth, vh: document.documentElement.clientHeight };
+    })()`));
   const panes = await A.eval(`(() => [...document.querySelectorAll('#stage .pane')]
     .map((p) => { const r = p.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; }))()`);
-  check('视频区是两块窗口（不是「对方铺满 + 自己小窗」）', panes.length === 2, panes);
-  check('两块窗口尺寸完全一致（显示比例不再一边大一边小）',
-    panes[0].w === panes[1].w && panes[0].h === panes[1].h, panes);
-  check('双方视频都用 object-fit: contain（完整显示，不裁切、不放大）',
-    await A.eval('getComputedStyle(document.getElementById("remote-video")).objectFit') === 'contain'
-    && await A.eval('getComputedStyle(document.getElementById("local-video")).objectFit') === 'contain');
+  check('舞台里确实是两块画面（大 + 小）', panes.length === 2, panes);
+  check('大窗严格 contain 不裁切，小窗用 cover 当缩略图',
+    await A.eval(`getComputedStyle(document.querySelector('#stage .pane:not(.small) video')).objectFit`) === 'contain'
+    && await A.eval(`getComputedStyle(document.querySelector('#stage .pane.small video')).objectFit`) === 'cover');
   check('视频窗口角标带上了设备名（视频里也能核对对面是谁）',
     /对方/.test(await A.eval('__rt.remoteTag')) && /我/.test(await A.eval('__rt.localTag')),
     { remote: await A.eval('__rt.remoteTag'), local: await A.eval('__rt.localTag') });
 
-  await A.shoot('docs/shot-stage-even.png');   // 默认：两格等分
+  await A.shoot('docs/shot-call-remote.png');   // 默认：对方铺满 + 我缩在右上角
 
-  // --- 8b-2. 点一格放大：大窗 + 右上角小窗（微信式）---
-  // 默认是等分（上面刚验过），所以这里只验「点过之后变成什么样、点另一格能不能换回来」。
-  check('没人点之前保持等分，也不带任何放大状态的类',
-    (await A.eval('__rt.stageMain')) === null && (await A.eval('__rt.stagePip')) === false,
-    { main: await A.eval('__rt.stageMain'), pip: await A.eval('__rt.stagePip') });
-
+  // --- 8b-2. 点画面切换大小（要能来回换）---
   await A.eval('document.getElementById("pane-local").click(), true');
-  check('点「我」这格 → 我铺满、对方缩成小窗',
+  check('点右上角小窗（我）→ 我铺满、对方缩成小窗',
     (await A.eval('__rt.stageMain')) === 'local'
     && (await A.eval('__rt.stagePip')) === true
     && JSON.stringify(await A.eval('__rt.smallPane')) === '["remote"]',
-    { main: await A.eval('__rt.stageMain'), small: await A.eval('__rt.smallPane') });
-
-  await A.eval('document.getElementById("pane-remote").click(), true');
-  check('再点「对方」这格 → 换成对方铺满、我缩成小窗（可来回切）',
-    (await A.eval('__rt.stageMain')) === 'remote'
-    && JSON.stringify(await A.eval('__rt.smallPane')) === '["local"]',
     { main: await A.eval('__rt.stageMain'), small: await A.eval('__rt.smallPane') });
 
   // 光看类名不够 —— 真放大得在**几何**上成立：大窗铺满舞台宽度，小窗明显更小
@@ -653,16 +739,18 @@ async function main() {
     await A.eval(`getComputedStyle(document.querySelector('#stage .pane:not(.small) video')).objectFit`) === 'contain'
     && await A.eval(`getComputedStyle(document.querySelector('#stage .pane.small video')).objectFit`) === 'cover');
 
-  await A.shoot('docs/shot-stage-pip.png');    // 放大后：对方铺满 + 我缩成右上角小窗
+  await A.shoot('docs/shot-call-self.png');    // 点过我这一格之后：我铺满 + 对方小窗
+
+  await A.eval('document.getElementById("pane-remote").click(), true');
+  check('再点对方那格 → 换回对方铺满、我缩成小窗（可来回切）',
+    (await A.eval('__rt.stageMain')) === 'remote'
+    && JSON.stringify(await A.eval('__rt.smallPane')) === '["local"]',
+    { main: await A.eval('__rt.stageMain'), small: await A.eval('__rt.smallPane') });
 
   // 摄像头朝向：初始必须是前置（手机上打开视频先看到自己），切换按钮只在真有多摄时露
   check('开视频默认用前置摄像头', (await A.eval('__rt.facing')) === 'user', await A.eval('__rt.facing'));
   console.log('   摄像头数量：', await A.eval('__rt.camCount'),
     '· 切换按钮：', (await A.eval('__rt.flipShown')) ? '显示' : '隐藏');
-
-  // 刻意**不**把布局复位：放大是「用户点过才有的状态」，没有回到等分的入口
-  //（等分只是初始态，不是可来回切的一档）。后面的用例都不依赖舞台等分，
-  // 让 A 停在这个状态反而顺带验证了「放大之后其余功能照常」。
 
   // --- 8b-3. 切换前后摄像头 ---
   // headless 只有一个假摄像头，真机才是双摄 —— 所以这里不赌「一定切得过去」，
@@ -800,18 +888,37 @@ async function main() {
     (await A.eval('__rt.facing')) === 'user');
 
   // --- 8c. 语音消息（按住说话）---
+  // 发消息是「聊天态」的事：先挂断那通视频，输入栏才会回来
+  await A.click('btn-hangup-call');
+  await waitUntil(async () => (await A.eval('__rt.inCall')) === false
+    && (await B.eval('__rt.inCall')) === false, '两端挂断', 20000);
+  check('挂断视频通话后输入栏回来了', await A.eval('__rt.composerHidden') === false);
+
   const voiceBefore = await B.eval('__rt.voiceCount');
   await A.click('btn-voice');
   check('输入栏能切到「按住说话」模式', await A.eval('__rt.voiceMode') === true);
-  check('切过去后文字输入框让位给了说话条',
+  check('切过去后文字输入框让位给了说话按钮',
     await A.eval('document.getElementById("text").hidden && !document.getElementById("hold-talk").hidden'));
+
+  // 「按住说话」在手机上是一条扁平长条时按不住 —— 现在是居中的大圆按钮
+  const holdBox = await A.eval('__rt.holdTalkBox');
+  check('「按住说话」是个放大的圆形按钮（手机上按得住）',
+    !!holdBox && holdBox.w >= 56 && holdBox.h >= 56 && holdBox.w === holdBox.h
+    && /50%|9999px/.test(holdBox.radius), holdBox);
+  check('按钮上给了一个话筒图标 + 「按住」两字（不是光秃秃一个色块）',
+    await A.eval(`!!document.querySelector('#hold-talk svg') && !!document.getElementById('hold-label')`));
 
   await A.eval(`(() => {
     const h = document.getElementById('hold-talk');
     h.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
     return true;
   })()`);
-  await sleep(1500);   // 录 1.5 秒（低于 0.5 秒会被当成误触丢弃）
+  await sleep(400);
+  check('按下后按钮进入录音态（变红 + 文案变「松开」）',
+    await A.eval(`document.getElementById('hold-talk').classList.contains('recording')`)
+    && await A.eval(`document.getElementById('hold-label').textContent`) === '松开',
+    await A.eval(`document.getElementById('hold-label').textContent`));
+  await sleep(1100);   // 总共录 ~1.5 秒（低于 0.5 秒会被当成误触丢弃）
   await A.eval(`window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })), true`);
 
   check('按住录、松手发：这条语音落到了自己的消息里',
@@ -857,13 +964,27 @@ async function main() {
   /* ---------------------------- 9. 房主先退，房间不关 ---------------------------- */
   section('9. 房主先退出 → 房里的人接任房主 → 原房主回来是后进者');
 
-  // 退出前先确认此刻确实开着摄像头 —— 否则下面那条「松开设备」的断言等于没测
+  // 退出前先在通话里把摄像头开着 —— 否则下面那条「退出时松开设备」的断言等于没测。
+  // （也顺手验证了「通话中直接点退出房间」这条更彻底的路：通话必须一并收干净。）
+  await A.click('btn-call-video');
+  await waitUntil(async () => await B.eval('__rt.ringShown'), 'B 弹出通话请求', 12000);
+  await B.click('ring-accept');
+  await waitUntil(async () => (await A.eval('__rt.media.video')) === true, 'A 摄像头就绪', 25000);
   const camWasOn = await A.eval('__rt.media.video');
+  check('退出前 A 正开着摄像头且在通话中',
+    camWasOn === true && await A.eval('__rt.inCall') === true);
+
   await A.eval('document.getElementById("btn-hangup").click(), true');
-  check('退出房间时真正松开摄像头与麦克风（设备指示灯必须灭）',
+  check('直接退出房间时：通话界面收起、摄像头与麦克风真正松开（设备指示灯必须灭）',
     camWasOn === true
-    && await A.eval('__rt.media.video === false && __rt.media.audio === false'),
+    && await A.eval('__rt.media.video === false && __rt.media.audio === false')
+    && await A.eval('__rt.inCall') === false,
     { camWasOn });
+  await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
+  check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);
+  check('对方退出后，我这边的通话也自动收掉了（不会留一个对着空房间的摄像头）',
+    await waitUntil(async () => (await B.eval('__rt.inCall')) === false, 'B 退出通话', 20000)
+      .then(() => true).catch(() => false), await B.eval('__rt.callKind'));
   await waitUntil(async () => (await B.eval('__rt.isHost')) === true, 'B 接任房主', 20000);
   check('房主退出的那一刻，房里剩下的人立刻成为新房主', true);
   check('新房主拿到了「请出房间」的权限', await B.eval('__rt.kickBtnShown') === true);

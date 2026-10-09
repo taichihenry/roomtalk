@@ -307,6 +307,7 @@ const S = {
 
   /* ---- 视频区布局 ---- */
   stageMain: null,      // 放大显示哪一格：null = 两格等分 | 'remote' | 'local'
+  stagePicked: false,   // 用户是否**亲手**点过画面（点过就尊重他的选择，不再自动摆）
   pipHinted: false,     // 「点一下能放大」只提示一次（每通电话一次）
 
   pending: [],         // 对端未确定时先收到的信令
@@ -322,6 +323,18 @@ const S = {
   ringKind: null,      // 正在响的来电类型：'audio' | 'video' | null
   ringTimer: null,
 
+  /* ---- 进行中的通话 ----
+   * callKind 是「通话态」的**唯一真相**：媒体开关（media.*）只表示我这边
+   * 麦克风/摄像头开没开，而「有没有在通话」由 callKind 说了算。
+   * 两者分开是必要的：视频通话里我能关掉摄像头继续通话（media.video=false
+   * 但 callKind='video'），换成「有媒体就算在通话」就表达不了这件事。
+   */
+  callKind: null,      // null | 'audio' | 'video'
+  callRinging: false,  // 我发起、对方还没接听
+  callStartedAt: 0,    // 接通时刻（计时从这一刻起）
+  callTimer: null,     // 界面上的时长刷新
+  callOutTimer: null,  // 呼叫超时（对方一直不接）
+
   /* ---- 语音消息 ---- */
   recorder: null,      // 正在进行的 MediaRecorder
   recChunks: [],
@@ -329,6 +342,7 @@ const S = {
   recTimer: null,      // 到点自动停
   recTimer2: null,     // 界面上的计时刷新
   voiceMode: false,    // 输入栏是否处于「按住说话」模式
+  voiceHinted: false,  // 「按住说话」的操作提示只说一次
 
   /* ---- 文件 / 语音传输 ---- */
   rx: null,            // 正在接收的传输 { id, kind, name, mime, size, dur, chunks, got, el }
@@ -842,6 +856,8 @@ function handlePeerLeft() {
   S.peerLeftTimer = setTimeout(() => {
     teardownPeer();
     dismissRing();
+    // 对端真走了 → 通话也结束：本地媒体必须收掉，否则摄像头指示灯一直亮着
+    stopLocalMedia();
     S.remotePeerId = null;
     S.peerName = '';
     syncMeta();
@@ -1189,6 +1205,10 @@ function bindDataChannel(dc) {
       onRing(m);
     } else if (m.t === 'ring-answer') {
       onRingAnswer(m);
+    } else if (m.t === 'bye') {
+      // 对方挂断了。立收回自己的麦克风/摄像头并退出通话界面 ——
+      // 只把界面收起来不停媒体，摄像头指示灯会一直亮着。
+      onBye();
     } else if (m.t === 'xfer') {
       onXferCtl(m);
     }
@@ -1201,9 +1221,14 @@ function bindDataChannel(dc) {
  * 收到对方的名片后，判断这次来的是不是「上次那个人」。
  *
  * 三种结果：
- *   · 没有记录   → 首次，记下来，并**如实告诉用户「这是第一次」**
+ *   · 没有记录   → 第一次，**如实说明，并把「要不要记住」交给用户点**
  *   · 和记录一致 → 熟人，安静，不打扰
  *   · 和记录不同 → 明确警告，并给出一键请出去的入口
+ *
+ * ⚠ 首访**绝不自动记住**。「谁先进房谁就是自己人」是最糟的信任模型：
+ *   口令是共享秘密，不速之客只要赶在真正的对方之前进来，就会被永久标记成
+ *   「已确认」—— 之后真正的对方反而成了「设备变过」的可疑对象。所以第一次
+ *   只报告事实，是否收下这台设备由用户按一下决定（TOFU 也要用户点头）。
  */
 function onPeerIdentity(id) {
   if (!id) return;
@@ -1228,8 +1253,9 @@ function onPeerIdentity(id) {
 
   const known = getTrusted(S.room);
   if (!known) {
-    setTrusted(S.room, id);
-    showTrust('new', '这是和这台设备的第一次通话，已记住它。以后再进来会显示为「已确认」。');
+    // 第一次：只说事实，不代用户做决定
+    showTrust('first',
+      '这是和这台设备的第一次通话。如果确认对方就是约好的人，可以点「记住这台设备」——下次它进来会显示「已确认」。');
   } else if (known === id) {
     // 熟人：只留一行极轻的确认，不打扰。但「请出房间」仍然可达 ——
     // 万一当初记住的就是个陌生人，用户得有反悔的入口。
@@ -1246,8 +1272,9 @@ function showTrust(kind, text) {
   if (text) {
     bar.className = 'trust' + (kind ? ' ' + kind : '');
     $('trust-text').textContent = text;
-    // 「记住这台」只在「设备变了」时有意义 —— 首次已经自动记住了
-    $('trust-keep').hidden = kind !== 'warn';
+    // 「记住这台设备」在两种情况下有意义：第一次见到它（待用户确认），
+    // 以及这次换了一台（用户可以把记录更新过去）。
+    $('trust-keep').hidden = !(kind === 'first' || kind === 'warn');
   }
   reflectHostUI();
 }
@@ -1309,6 +1336,8 @@ function kickPeer(note) {
   if (dev && S.autoKick) addBlocked(S.room, dev);
 
   teardownPeer();
+  // 人被赶走了，通话自然也没了 —— 顺手收掉本地媒体，别让摄像头对着空房间
+  stopLocalMedia();
   S.remotePeerId = null;
   S.peerName = '';          // teardownPeer 刻意不管这个，见那里的说明
   showTrust('', '');
@@ -1329,6 +1358,10 @@ function sendText(text) {
 }
 
 function pushMediaState() {
+  // 还在「正在呼叫」阶段就先别报 —— 否则对方还没接，界面就会先一步显示
+  // 「对方开着麦克风」，而他的聊天窗口并不该因为一个还没接的呼叫进入通话态。
+  // 接通那一刻（onRingAnswer / acceptRing）会补一次。
+  if (S.callRinging) return;
   sendCtl({ t: 'media', media: S.media, quality: currentQuality() });
 }
 
@@ -1560,7 +1593,14 @@ function setVoiceMode(on) {
   $('text').hidden = on;
   $('hold-talk').hidden = !on;
   $('btn-send').hidden = on;
+  // .voice 一挂上，那颗话筒就从长条变成居中的大圆（见 app.css）——
+  // 手机上长条按不住，圆形落点稳得多
+  $('composer').classList.toggle('voice', on);
   if (!on) $('text').focus();
+  else if (!S.voiceHinted) {
+    S.voiceHinted = true;
+    toast('按住圆形按钮说话，松手发送', 3200);
+  }
 }
 
 async function sendFiles(fileList) {
@@ -1700,8 +1740,10 @@ async function refreshCamCount() {
     n = list.filter((d) => d.kind === 'videoinput').length;
   } catch { /* 拿不到就当作 0：按钮不显示，功能不受影响 */ }
   S.camCount = n;
+  // 按钮只在「正在视频通话 + 真有 >= 2 颗摄像头」时才露。
+  // 桌面单摄笔记本上没它什么事，语音通话里更没有。
   const b = $('btn-flip');
-  if (b) b.hidden = n < 2;
+  if (b) b.hidden = !(n >= 2 && S.callKind === 'video');
 }
 
 /** 「设备忙 / 读不到」类错误 —— 只有这类才值得「先释放旧摄像头再重试」 */
@@ -1910,7 +1952,15 @@ async function flipCamera() {
   }
 }
 
+/**
+ * 通话中开关自己的麦克风 / 摄像头。
+ *
+ * ⚠ 这两颗按钮现在只长在**通话界面**里（顶栏那份已经拿掉），所以必须先确认
+ * 有通话在进行。否则它们会变成「一键开麦但对面听不到」的假开关 ——
+ * 一边采集一边没人接，用户只会以为产品坏了。
+ */
 async function toggleMic() {
+  if (!inCall()) { toast('先发起通话，再调麦克风'); return; }
   if (!S.micTrack) { await ensureMic(); return; }
   S.micTrack.enabled = !S.micTrack.enabled;
   S.media.audio = S.micTrack.enabled;
@@ -1920,6 +1970,8 @@ async function toggleMic() {
 }
 
 async function toggleCam() {
+  if (!inCall()) { toast('先发起通话，再调摄像头'); return; }
+  if (S.callKind !== 'video') { toast('这次是语音通话，没有摄像头可调'); return; }
   if (!S.camTrack) { await ensureCam(); return; }
   S.camTrack.enabled = !S.camTrack.enabled;
   S.media.video = S.camTrack.enabled;
@@ -1952,7 +2004,124 @@ function setAudioBlocked(on) {
   if (b) b.hidden = !on;
 }
 
-/* ---------------------------- 发起 / 接听通话 ---------------------------- */
+/* ============================== 通话 ============================== */
+
+/**
+ * 通话态 = 有 `callKind`。
+ *
+ * 为什么把「通话」做成一个**显式状态**，而不是从 media 推导出来：
+ *   · 通话界面该不该全屏铺开；
+ *   · 输入栏该不该收起（收起 = 从界面上堵掉「通话中又去点发起通话」）；
+ *   · 重连 / 对方退出这几条路径上，通话该继续还是该结束。
+ * 这三件事都需要一个确定的答案，而 media 表达不了 —— 视频通话里我能把摄像头
+ * 关掉继续通话（media.video=false 但还在通话里）。
+ */
+function inCall() { return S.callKind !== null; }
+
+/** 视频通话里画面是不是真的在显示（双方都关了摄像头时就不显示） */
+function callVideoOn() {
+  return S.callKind === 'video' && (S.media.video || S.remoteMedia.video);
+}
+
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function updateCallTimer() {
+  const el = $('call-timer');
+  if (!el) return;
+  el.textContent = S.callStartedAt ? fmtClock(Date.now() - S.callStartedAt) : '';
+}
+
+function startCallTimer() {
+  stopCallTimer();
+  updateCallTimer();
+  S.callTimer = setInterval(updateCallTimer, 1000);
+}
+
+function stopCallTimer() {
+  if (S.callTimer) { clearInterval(S.callTimer); S.callTimer = null; }
+}
+
+/**
+ * 进入通话（界面部分）。媒体采集由调用方负责 —— 顺序不能乱：
+ * 「呼叫」时先开自己的麦（那是我的手势），「接听」时开麦发生在这一步之前。
+ */
+function beginCall(kind, ringing) {
+  S.callKind = kind;
+  S.callRinging = !!ringing;
+  S.callStartedAt = 0;
+  // 画面布局回默认：具体摆成什么样由 applyStageLayout 按双方有没有画面决定
+  // （见那里的说明），这里只把「用户亲手点过」的痕迹清掉。
+  S.stageMain = null;
+  S.stagePicked = false;
+  syncCallUI();
+  syncStage();
+  queueFitStage();
+  pushMediaState();
+}
+
+/** 刷新通话界面上的文字（对方设备名 / 状态 / 时长） */
+function updateCallHead() {
+  const peer = $('call-peer');
+  if (peer) peer.textContent = S.peerName || '对方';
+  const state = $('call-state');
+  if (state) {
+    state.textContent = S.callRinging
+      ? '正在呼叫…'
+      : (S.callKind === 'video' ? '视频通话中' : '语音通话中');
+  }
+  const timer = $('call-timer');
+  if (timer) timer.textContent = S.callRinging ? '' : (S.callStartedAt ? fmtClock(Date.now() - S.callStartedAt) : '');
+}
+
+/** 把通话状态落到 DOM 上。幂等，随便调。 */
+function syncCallUI() {
+  const on = inCall();
+  const room = $('room');
+  if (room) room.classList.toggle('call-mode', on);
+
+  const bar = $('call-ui');
+  if (bar) bar.hidden = !on;
+  if (!on) return;
+
+  // 画面真的出现时藏掉头像占位；双方都关了摄像头时它当兜底
+  const audioView = $('call-audio');
+  if (audioView) audioView.hidden = callVideoOn();
+
+  // 语音通话里没有摄像头可关，「翻转」更是只对视频通话有意义
+  const cam = $('btn-cam');
+  if (cam) cam.hidden = S.callKind !== 'video';
+  const flip = $('btn-flip');
+  if (flip) flip.hidden = !(S.callKind === 'video' && S.camCount >= 2);
+
+  updateCallHead();
+}
+
+/**
+ * 结束通话（挂断）。
+ *
+ * @param {{silent?: boolean, note?: string}} o
+ *   silent —— 不发 bye（对方先挂断 / 拒绝时，再回一条没有意义）
+ *   note   —— 用哪句话告诉用户「为什么结束了」
+ */
+function endCall(o = {}) {
+  if (!inCall()) return;
+  // 先告诉对方一声，让他那边立刻收起界面，而不是干等超时
+  if (!o.silent) sendCtl({ t: 'bye' });
+  clearTimeout(S.callOutTimer);
+  S.callOutTimer = null;
+  // stopLocalMedia 会把通话态一并复位（见那里的说明）
+  stopLocalMedia();
+  notice(o.note || '通话已结束');
+}
+
+/** 对方挂断了 */
+function onBye() {
+  if (!inCall()) return;
+  endCall({ silent: true, note: '对方已挂断通话' });
+}
 
 /**
  * 发起一次通话。
@@ -1969,18 +2138,48 @@ function setAudioBlocked(on) {
  */
 async function startCall(kind) {
   if (!connected()) { toast('还没和对方接通，请稍候'); return; }
+  // 通话是互斥的。界面上输入栏已经被全屏通话界面盖住了，这里是第二道保险 ——
+  // 自动化脚本、无障碍工具、以及各种边角时序都可能绕过界面。
+  if (inCall()) { toast('正在通话中，请先挂断'); return; }
+  if (S.ringKind) { toast('对方正在来电，请先接听或拒绝'); return; }
+
   const okMic = await ensureMic();
   if (!okMic) return;
-  if (kind === 'video') await ensureCam();
+  if (kind === 'video') {
+    // 摄像头拿不到就别开视频通话：对面看到的会是一个「视频通话却只有一方有
+    // 画面」的怪界面，不如直接把话说清楚
+    const okCam = await ensureCam();
+    if (!okCam) { stopLocalMedia(); return; }
+  }
+
+  // 上面两个 await 期间用户可能又点了另一颗按钮 —— 再确认一次
+  if (inCall()) return;
+
+  beginCall(kind, true);
   sendCtl({ t: 'ring', kind, name: S.myName || '' });
   notice(kind === 'video' ? '已发起视频通话，等对方接听' : '已发起语音通话，等对方接听');
+
+  // 对方一直不接就收摊，别给发起方留一个永远不结束的呼叫
+  clearTimeout(S.callOutTimer);
+  S.callOutTimer = setTimeout(() => {
+    if (S.callRinging) endCall({ note: '对方没有接听' });
+  }, 30_000);
 }
 
 /** 收到对方的呼叫请求 → 亮出来电浮层。 */
 function onRing(m) {
   const kind = m.kind === 'video' ? 'video' : 'audio';
+
+  // 已经在通话了（两边几乎同时按下的情况）：直接回绝，
+  // 否则会在通话中途弹出第二个来电浮层，把当前这通搅乱
+  if (inCall()) {
+    sendCtl({ t: 'ring-answer', kind, accept: false });
+    notice('你正在通话中，已回绝对方这次的呼叫');
+    return;
+  }
+
   S.ringKind = kind;
-  $('ring-avatar').textContent = kind === 'video' ? '📹' : '📞';
+  $('ring').className = 'ring' + (kind === 'video' ? ' kind-video' : '');
   $('ring-title').textContent = `对方想和你${kind === 'video' ? '视频' : '语音'}通话`;
   $('ring-sub').textContent = (m.name ? `对方设备：${m.name}\n` : '')
     + '接听后才会打开你的麦克风';
@@ -2004,9 +2203,17 @@ async function acceptRing() {
   dismissRing();
   const ok = await ensureMic();       // ← 这次点击就是「用户手势」，顺带解锁远端音频播放
   if (!ok) { sendCtl({ t: 'ring-answer', kind, accept: false }); return; }
-  if (kind === 'video') await ensureCam();
+  if (kind === 'video') {
+    // 摄像头没拿到就降级成语音接通，而不是把整通电话推掉 —— 至少还能说上话
+    const okCam = await ensureCam();
+    if (!okCam) toast('摄像头没打开，已按语音通话接通');
+  }
   await ensureRemotePlayback();
   sendCtl({ t: 'ring-answer', kind, accept: true });
+  beginCall(kind === 'video' && S.media.video ? 'video' : 'audio', false);
+  S.callStartedAt = Date.now();
+  startCallTimer();
+  updateCallHead();
   notice('已接听');
 }
 
@@ -2018,8 +2225,22 @@ function declineRing() {
 }
 
 function onRingAnswer(m) {
-  if (m.accept) { notice('对方已接听'); toast('已接通'); }
-  else { notice('对方拒绝了通话请求'); toast('对方拒绝了这次通话'); }
+  if (m.accept) {
+    if (!inCall()) return;
+    S.callRinging = false;
+    S.callStartedAt = Date.now();
+    startCallTimer();
+    clearTimeout(S.callOutTimer);
+    S.callOutTimer = null;
+    updateCallHead();
+    pushMediaState();      // 呼叫期间刻意没报状态，现在正式接通了补一次
+    notice('对方已接听');
+    toast('已接通');
+    return;
+  }
+  // 对方拒绝：这边也收干净，否则麦克风一直开着、界面一直挂着「正在呼叫」
+  if (inCall()) endCall({ silent: true, note: '对方拒绝了通话请求' });
+  toast('对方拒绝了这次通话');
 }
 
 function ensureLocalStream() {
@@ -2040,14 +2261,28 @@ function stopLocalMedia() {
   setAudioBlocked(false);
   dismissRing();
 
-  // 布局与摄像头偏好一并复位：下一通回到默认的「两格等分 + 前置摄像头」，
-  // 就像刚打开一样 —— 上一通点过放大、翻过后置，不该带到下一通里。
+  // 通话态与布局一并复位。**挂在 stopLocalMedia 上而不是 endCall 上**：
+  // 退出房间、被请出、对方离开……这些路径都会停媒体，但都不是「挂断」。
+  // 只要媒体停了，全屏通话界面就必须跟着退掉 —— 否则用户看到的是一个
+  // 没有画面、也没有麦克风的通话界面，只会以为「挂不掉」。
+  clearTimeout(S.callOutTimer);
+  S.callOutTimer = null;
+  stopCallTimer();
+  S.callKind = null;
+  S.callRinging = false;
+  S.callStartedAt = 0;
+
+  // 布局与摄像头偏好也复位：下一通回到默认的「对方铺满 + 前置摄像头」，
+  // 就像刚接通一样 —— 上一通点过放大、翻过后置，不该带到下一通里。
   S.stageMain = null;
+  S.stagePicked = false;
   S.pipHinted = false;
   S.facing = 'user';
   S.flipLog = [];
   applyMirror();
-  applyStageLayout();
+  syncCallUI();
+  syncStage();
+  pushMediaState();     // 让对端立刻收起界面，而不是等它自己超时
 }
 
 /* ============================== 界面同步 ============================== */
@@ -2077,17 +2312,27 @@ function syncMediaUI() {
   const callV = $('btn-call-video');
   if (callA) callA.classList.toggle('on', S.media.audio && S.remoteMedia.audio);
   if (callV) callV.classList.toggle('on', S.media.video && S.remoteMedia.video);
+
+  // 通话界面里那排按钮（麦克风 / 摄像头 / 翻转）也跟着刷新
+  syncCallUI();
 }
 
+/**
+ * 视频区的显隐与文案。
+ *
+ * ⚠ 视频舞台**只在视频通话里出现**。语音通话用全屏的头像视图（微信语音通话
+ * 就是那样），非通话状态更不该占屏幕 —— 之前那版「有音频就显示一块空舞台、
+ * 里面写『语音通话中』」，在全屏通话界面里显得很将就。
+ */
 function syncStage() {
   const stage = $('stage');
   const lv = $('local-video');
-  const anyVideo = S.media.video || S.remoteMedia.video;
-  const anyAudio = S.media.audio || S.remoteMedia.audio;
+  const showVideo = callVideoOn();
 
-  if (!anyVideo && !anyAudio) {
+  if (!showVideo) {
     stage.hidden = true;
     stage.style.height = '';      // 收起时把内联高度清掉，别把上次的算出来
+    syncCallUI();
     return;
   }
   stage.hidden = false;
@@ -2102,9 +2347,7 @@ function syncStage() {
   const remoteVideoOn = S.remoteMedia.video;
   empty.hidden = remoteVideoOn;
   if (!remoteVideoOn) {
-    empty.textContent = anyAudio && !anyVideo
-      ? '语音通话中'
-      : (S.remoteMedia.audio ? '对方开着麦克风，没开摄像头' : '对方还没打开摄像头');
+    empty.textContent = S.remoteMedia.audio ? '对方开着麦克风，没开摄像头' : '对方还没打开摄像头';
   }
 
   // 角标带上设备名 + 麦克风状态。
@@ -2128,19 +2371,21 @@ function syncStage() {
   // 只说一次（每通电话一次），说多了就是噪音。
   if (!S.pipHinted && S.media.video && S.remoteMedia.video) {
     S.pipHinted = true;
-    notice('点任意一格画面可以放大，再点另一格就换回来');
+    notice('点小窗可以把自己那格换到大的位置，再点对方那格就换回来');
   }
 
+  syncCallUI();
   applyStageLayout();
 }
 
 /* ---------------------------- 视频区：等分 / 放大 ---------------------------- */
 
 /**
- * 点某一格 = 把那一格放大、另一格缩成右上角小窗（微信的做法）。
+ * 点某一格 = 把那一格放大、另一格缩成右上角小窗。
  *
- * 默认仍是**两格等分**：那是「两端看到的一样大」的前提，不能丢。
- * 两档之间不做任何自动切换 —— 只有用户点过才会变，否则画面自己跳来跳去更烦人。
+ * 视频通话的**初始态就是**「对方铺满 + 我右上角小窗」（见 applyStageLayout），
+ * 这里管的是用户点过之后怎么切：点哪格哪格变大，点已经大的那格不动。
+ * 不做自动来回切 —— 画面自己跳来跳去比一直大着更烦人。
  */
 function setStageMain(slot) {
   // 点的那格必须真的有画面：把一块「对方还没打开摄像头」的占位放大毫无意义
@@ -2148,6 +2393,7 @@ function setStageMain(slot) {
   if (slot === 'remote' && !S.remoteMedia.video) return;
   if (S.stageMain === slot) return;      // 已经是大的了，再点不做事
   S.stageMain = slot;
+  S.stagePicked = true;                  // 从此不再自动摆位（否则用户刚点完就被改回去）
   applyStageLayout();
 }
 
@@ -2156,9 +2402,20 @@ function applyStageLayout() {
   const stage = $('stage');
   if (!stage) return;
 
-  // 放大那格的主人把摄像头关了 → 立刻回落等分，别把一块占位框放大着
-  if (S.stageMain && !(S.stageMain === 'local' ? S.media.video : S.remoteMedia.video)) {
-    S.stageMain = null;
+  if (S.callKind === 'video') {
+    const R = !!S.remoteMedia.video;
+    const L = !!S.media.video;
+    if (!S.stagePicked) {
+      // 没被用户点过 → 自动摆成微信那个样子：**对方铺满，自己右上角小窗**。
+      // 对方画面还没到的这一小段先看自己：给一块「对方还没打开摄像头」的大占位
+      // 比什么都难受，而这时候用户最想确认的恰恰是「我这边出画了吗」。
+      // 对方的画面一到（remoteMedia.video 转 true）就自动让位给他。
+      S.stageMain = R ? 'remote' : (L ? 'local' : 'remote');
+    } else if (S.stageMain && !(S.stageMain === 'local' ? L : R)) {
+      // 用户选中的那格对面关了摄像头 → 让给还有画面的另一格
+      const other = S.stageMain === 'local' ? 'remote' : 'local';
+      if (other === 'local' ? L : R) S.stageMain = other;
+    }
   }
 
   const pip = !!S.stageMain;
@@ -2189,6 +2446,10 @@ function applyStageLayout() {
 function fitStage() {
   const stage = $('stage');
   if (!stage || stage.hidden) return;
+
+  // 全屏通话态：高度只由视口决定（CSS 里写了 inset: 0），
+  // 不该再按摄像头比例去算 —— 那样反而会把铺满的舞台压成一条。
+  if (S.callKind) { stage.style.height = ''; return; }
 
   const ratioOf = (v) => (v && v.videoWidth && v.videoHeight ? v.videoWidth / v.videoHeight : 0);
   // 对方还没出画面时，用自己摄像头的比例兜底（通常两台设备的摄像头是同类）
@@ -2245,6 +2506,8 @@ window.__rt = {
   get kickBtnShown() { return !$('trust-kick').hidden; },
   get trustShown() { return !$('trust').hidden; },
   get trustClass() { return $('trust').className; },
+  get trustText() { return $('trust-text').textContent; },
+  get trustKeepShown() { return !$('trust-keep').hidden; },
   get kickedCount() { return S.kickedCount; },
   get videoTuned() { return S.videoTuned; },
   get quality() { return currentQuality(); },
@@ -2315,6 +2578,26 @@ window.__rt = {
   get audioUnlockShown() { return !$('audio-unlock').hidden; },
   get ringShown() { return !$('ring').hidden; },
   get stageShown() { return !$('stage').hidden; },
+
+  /* ---- 通话态（排障与自动化测试用）---- */
+  get callKind() { return S.callKind; },
+  get inCall() { return inCall(); },
+  get callRinging() { return S.callRinging; },
+  get callUiShown() { return !$('call-ui').hidden; },
+  get callMode() { return $('room').classList.contains('call-mode'); },
+  get callTimerText() { return $('call-timer').textContent; },
+  get callPeerText() { return $('call-peer').textContent; },
+  get callStateText() { return $('call-state').textContent; },
+  /** 通话全屏时输入栏应当被收起 —— 这正是「不能再点发起通话」的界面保证 */
+  get composerHidden() { return getComputedStyle($('composer')).display === 'none'; },
+  /** 「按住说话」那颗按钮的实际尺寸（验证它真的是个放大的圆） */
+  get holdTalkBox() {
+    const el = $('hold-talk');
+    if (!el || el.hidden) return null;
+    const r = el.getBoundingClientRect();
+    return { w: Math.round(r.width), h: Math.round(r.height),
+             radius: getComputedStyle(el).borderRadius };
+  },
   get localTag() { return $('tag-local').textContent; },
   get remoteTag() { return $('tag-remote').textContent; },
   get facing() { return S.facing; },
@@ -2327,6 +2610,8 @@ window.__rt = {
   /** 重新数一遍摄像头数量（用户去系统设置改过权限后，不用刷新页面） */
   refreshCams() { refreshCamCount(); },
   get stageMain() { return S.stageMain; },
+  /** 用户是否亲手点过某一格 —— 点过之后程序不再自动改布局，直到这通电话结束 */
+  get stagePicked() { return S.stagePicked; },
   get stagePip() { return $('stage').classList.contains('pip'); },
   get smallPane() {
     return [...document.querySelectorAll('#stage .pane.small')].map((p) => p.dataset.slot);
@@ -2355,7 +2640,9 @@ function boot() {
   // 身份提示条上的两个动作
   $('trust-keep').addEventListener('click', () => {
     if (S.peerDeviceId) setTrusted(S.room, S.peerDeviceId);
-    showTrust('', '');
+    // 改成「已确认」而不是把提示条收掉：用户刚做完一个决定，界面得给个回执，
+    // 否则会怀疑自己是不是点空了
+    showTrust('ok', '已确认为熟悉的设备');
     toast('已把这台设备记为对方');
   });
   $('trust-kick').addEventListener('click', () => kickPeer());
@@ -2399,20 +2686,27 @@ function boot() {
   // pointerup/pointercancel 挂在 window 而不是按钮上 —— 手指按住后划出按钮范围
   // 再松开时，按钮收不到 pointerup，录音就会一直挂着。
   const hold = $('hold-talk');
+  const holdLabel = $('hold-label');
+  const setHoldLabel = (t) => { if (holdLabel) holdLabel.textContent = t; };
   let holdWanted = false;   // 手指还按着吗
+
+  // 长按弹系统菜单（iOS 会选中文字、Android 会弹「复制链接」）会打断按住不放，
+  // 这是「按不住」最常见的另一半原因
+  hold.addEventListener('contextmenu', (ev) => ev.preventDefault());
 
   hold.addEventListener('pointerdown', async (ev) => {
     ev.preventDefault();
+    if (holdWanted) return;
     holdWanted = true;
     hold.classList.add('recording');
-    hold.textContent = '松开 发送';
+    setHoldLabel('松开');
 
     await startRecord();     // 申请麦克风是异步的，这期间用户可能已经松手了
 
     if (!S.recorder) {       // 起录失败（没权限 / 不支持）
       holdWanted = false;
       hold.classList.remove('recording');
-      hold.textContent = '按住 说话';
+      setHoldLabel('按住');
       return;
     }
     // 松手发生在麦克风就绪之前 → 这条本来就没打算录，直接丢弃。
@@ -2420,7 +2714,7 @@ function boot() {
     if (!holdWanted) {
       stopRecord(true);
       hold.classList.remove('recording');
-      hold.textContent = '按住 说话';
+      setHoldLabel('按住');
     }
   });
 
@@ -2428,7 +2722,7 @@ function boot() {
     holdWanted = false;
     if (!S.recorder) return;
     hold.classList.remove('recording');
-    hold.textContent = '按住 说话';
+    setHoldLabel('按住');
     stopRecord();
   };
   window.addEventListener('pointerup', endHold);
@@ -2436,7 +2730,7 @@ function boot() {
     holdWanted = false;
     if (!S.recorder) return;
     hold.classList.remove('recording');
-    hold.textContent = '按住 说话';
+    setHoldLabel('按住');
     stopRecord(true);
   });
 
@@ -2463,6 +2757,8 @@ function boot() {
   $('btn-mic').addEventListener('click', toggleMic);
   $('btn-cam').addEventListener('click', toggleCam);
   $('btn-flip').addEventListener('click', flipCamera);
+  // 挂断：只结束通话，人还留在房间里（要离开房间是顶栏那个 ✕）
+  $('btn-hangup-call').addEventListener('click', () => endCall());
 
   // 视频区：点哪一格，哪一格放大（另一格缩成小窗）。键盘 Enter / 空格同样可用 ——
   // 这两格是 role="button"，不让键盘用户点得动就是假的按钮。

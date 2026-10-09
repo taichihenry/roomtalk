@@ -103,6 +103,15 @@ button { cursor: pointer; }
 .icon.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--line)); }
 .icon.danger:hover { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
 
+/* ---------------------------------------------------------------------------
+   图标一律用内联 SVG，**不再用 emoji**。
+
+   emoji 的观感由系统自带字体决定：同一个「📹」在 iOS、Android、Windows 上是
+   三个完全不同的东西，有几个（尤其 Windows 那套）丑到不像同一个产品里的。
+   描边 SVG 走 currentColor，状态色一改整个图标跟着变，也永远对齐。
+   --------------------------------------------------------------------------- */
+.icon svg { width: 19px; height: 19px; display: block; }
+
 /* 画质档位。刻意用原生 select 而不是自绘菜单：
    手机上点开就是系统选择器，可点区域大、不用自己处理定位和点外关闭。 */
 .quality {
@@ -449,6 +458,12 @@ button { cursor: pointer; }
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   color: var(--text);
 }
+/* 「第一次和这台设备通话」——刻意做得比警告轻、比熟人提示重一点。
+   它既不是故障也不是威胁，只是提醒用户「此设备尚未由你确认过」。 */
+.trust.first {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--text);
+}
 .trust.warn {
   background: color-mix(in srgb, var(--warn) 14%, var(--surface));
   color: var(--text);
@@ -457,13 +472,15 @@ button { cursor: pointer; }
 .trust-actions { display: flex; gap: 6px; flex: none; }
 
 /* ---------------------------- 视频舞台 ----------------------------
- * 两块窗口**等分**，尺寸完全一致 —— 横屏竖屏都是左右并排。
- * 之前是「对方铺满整块 + 自己缩在右下角 26% 的小窗」，两端看到的比例差极大，
- * 而且整块舞台是固定宽高比，对方画面被 object-fit: cover 硬裁 —— 就是用户说的
- * 「显示不全、像被局部放大」。现在改成一样大的两格。
+ * 只在**视频通话**里出现（由 app.js 的 syncStage 决定显隐）。
+ *
+ * 基础布局是两块等大的窗口（横屏竖屏都左右并排）—— 它是 .pip 之外的兜底形态，
+ * 比如只有一方有画面时用得上。真正通话时默认走下面的 .pip：
+ * **一方铺满、另一方缩成右上角小窗**（微信视频通话就是这个样子），点小窗互换。
  *
  * 每格用 object-fit: contain（完整显示，宁可留黑边也不裁）：
  * 视频通话里「看得见整个人」比「填满每一像素」重要得多。
+ * 唯独右上角那个小窗例外（改用 cover）：巴掌大的缩略图再留一圈黑边就啥也看不见了。
  *
  * ⚠ 高度是按「摄像头大致的长宽比」倒推的，不是随手写的数：
  *   两栏并排时每格宽约 50vw，所以
@@ -587,6 +604,131 @@ button { cursor: pointer; }
   max-width: calc(100% - 8px);
 }
 
+/* ===========================================================================
+   通话界面（全屏）—— 参考微信通话窗口
+
+   通话中要「只做一件事」：看着对方说话。所以这一态把聊天相关的部分全收起
+   （顶栏、设备名条、身份条、消息流、输入栏），只留画面 + 挂断/静音/翻转。
+
+   顺带解决一个产品问题：输入栏一收，「已经在通话了又去点发起通话」就无从发生。
+   =========================================================================== */
+
+.room.call-mode { background: #0b0d11; }
+
+.room.call-mode > .bar,
+.room.call-mode > .meta,
+.room.call-mode > .trust,
+.room.call-mode > .log,
+.room.call-mode > .composer { display: none; }
+
+/* 舞台铺满整屏。用 !important 压掉 fitStage 可能写下的内联高度 ——
+   全屏这一态高度只由视口决定，不该再按摄像头比例算。 */
+.room.call-mode .stage,
+.room.call-mode .stage.pip {
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
+  height: auto;
+  z-index: 60;
+  background: #000;
+}
+
+/* 小窗略大一点：全屏之后 30% 也能看得清，但仍然明显小于大窗。
+   位置固定在右上角 —— 和微信一致，也不会被下方那排按钮压住。 */
+.room.call-mode .stage.pip .pane.small {
+  top: max(14px, env(safe-area-inset-top));
+  right: 14px;
+  width: 32%;
+  max-width: 150px;
+}
+
+/* 通话信息（对方设备名 + 时长）。靠左上，右侧留给小窗，所以限宽 + 省略号。 */
+.call-ui { position: fixed; inset: 0; z-index: 70; pointer-events: none; }
+
+.call-head {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  padding: max(14px, env(safe-area-inset-top)) 16px 0;
+  color: #fff;
+}
+.call-peer {
+  max-width: calc(100% - 160px);   /* 右边是右上角那个小窗，别压上去 */
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, .6);
+}
+.call-sub {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, .78);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, .6);
+}
+.call-timer { font-variant-numeric: tabular-nums; }
+
+/* 语音通话（或视频通话里双方都没开画面）的占位视图 */
+.call-audio {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  color: #fff;
+}
+.call-avatar {
+  width: 96px; height: 96px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .12);
+  border: 1px solid rgba(255, 255, 255, .18);
+}
+.call-avatar svg { width: 42px; height: 42px; }
+.call-audio-hint {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, .72);
+  letter-spacing: .04em;
+}
+
+/* 底部那排圆形按钮：挂断居中偏右，其余排在左边 —— 和微信的手感一致 */
+.call-actions {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 18px 16px max(20px, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(0, 0, 0, .55), rgba(0, 0, 0, 0));
+}
+
+.call-actions .cbtn {
+  pointer-events: auto;
+  width: 54px; height: 54px;
+  border-radius: 50%;
+  border: 0;
+  background: rgba(255, 255, 255, .16);
+  color: #fff;
+  backdrop-filter: blur(6px);
+  transition: background .15s, transform .1s, color .15s;
+}
+.call-actions .cbtn:hover { background: rgba(255, 255, 255, .24); }
+.call-actions .cbtn:active { transform: scale(.92); }
+.call-actions .cbtn svg { width: 23px; height: 23px; display: block; }
+/* 关掉的麦克风/摄像头：灰底 + 划掉的感觉（用降低不透明度表达） */
+.call-actions .cbtn:not(.on) { color: rgba(255, 255, 255, .62); }
+.call-actions .cbtn.on { background: rgba(255, 255, 255, .92); color: #14171a; }
+
+/* 挂断：红底白字，和微信那颗一样是全场最醒目的一颗 */
+.call-actions .cbtn.hangup { background: var(--danger); color: #fff; }
+.call-actions .cbtn.hangup:hover { filter: brightness(1.08); background: var(--danger); }
+.call-actions .cbtn.hangup svg { transform: rotate(135deg); }
+
 /* 声音被浏览器拦住时的解锁条 */
 .audio-unlock {
   flex: none;
@@ -600,6 +742,21 @@ button { cursor: pointer; }
   text-align: center;
 }
 .audio-unlock:hover { filter: brightness(.98); }
+/* 通话全屏时它得浮在最上面 —— 否则会被铺满整屏的舞台盖住，
+   而「听不到对方」恰恰是通话中最需要看到这条提示的时刻。
+   放底部（按钮上方）而不是顶部：顶上那一行是「对面是谁 + 通了多久」，
+   压住它反而让人更慌。 */
+.room.call-mode .audio-unlock {
+  position: fixed;
+  top: auto;
+  bottom: 104px;
+  left: 12px; right: 12px;
+  width: auto;
+  z-index: 80;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
 
 /* ---------------------------- 消息 ----------------------------
  * 结构照微信来：浅灰底、左右分侧的圆角气泡、气泡带小尖角、
@@ -797,6 +954,23 @@ button { cursor: pointer; }
   background: color-mix(in srgb, var(--ok) 16%, transparent);
 }
 
+/* 图标统一 21px 描边 SVG（见文件上方那条说明：不用 emoji）。 */
+.cbtn svg { width: 21px; height: 21px; display: block; }
+
+/* 「语音 / 键盘」是同一颗按钮的两个面：语音模式时才把话筒换成键盘。
+   （用 CSS 切而不是换 innerHTML —— 换 innerHTML 会重建节点，
+    正在按住的指针事件会被打断。） */
+#btn-voice .i-kbd { display: none; }
+#btn-voice.on .i-mic { display: none; }
+#btn-voice.on .i-kbd { display: block; }
+
+/* 两个「发起通话」入口各自带一点自己的颜色：
+   语音是绿的（接通）、视频是蓝的（和品牌色一致）。 */
+#btn-call-audio { color: var(--ok); }
+#btn-call-audio:hover { background: color-mix(in srgb, var(--ok) 12%, transparent); }
+#btn-call-video { color: var(--accent); }
+#btn-call-video:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
 .composer input#text {
   flex: 1;
   min-width: 0;
@@ -818,32 +992,50 @@ button { cursor: pointer; }
   font-size: 14px;
 }
 
-/* 「按住 说话」—— 语音模式下的输入区 */
+/* 「按住说话」—— 语音模式下取代输入框的那颗按钮。
+   ⚠ 刻意做成**居中放大的圆**，而不是原来那条扁平长条：
+     长条看着好按，实际上拇指按住之后稍微一滑就出界，pointerup 收不到 ——
+     表现就是「按住了却松不开 / 按住了没反应」，用户的原话是
+     「经常无法持续按住触发」。圆形落点稳得多，直径也给足。
+   62px 是按拇指腹的接触面留的余量，不是随手写的一个数。 */
 .hold-talk {
-  flex: 1;
-  min-width: 0;
-  padding: 9px 12px;
+  flex: none;
+  width: 62px;
+  height: 62px;
+  margin: 0 auto;              /* 左右两组按钮数量相同，auto 边距正好把它居中 */
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 2px;
+  padding: 0;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 50%;
   background: var(--surface-2);
   color: var(--muted);
-  font-size: 14.5px;
+  font-size: 10.5px;
+  line-height: 1;
   user-select: none;
-  touch-action: none;          /* 长按不能弹系统菜单 */
+  touch-action: none;          /* 长按不能弹系统菜单、不能触发滚动 */
   -webkit-user-select: none;
   -webkit-touch-callout: none;
+  transition: background .15s, border-color .15s, color .15s, transform .1s;
 }
+.hold-talk svg { width: 22px; height: 22px; display: block; }
+.hold-talk:active { transform: scale(.96); }
 .hold-talk.recording {
-  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  background: var(--danger);
   border-color: var(--danger);
-  color: var(--danger);
+  color: #fff;
+  transform: scale(1.06);
 }
 
-/* 窄屏：把「发送」收成箭头，给输入框让位 */
+/* 窄屏：把按钮收紧，给输入框让位 */
 @media (max-width: 420px) {
   .composer { gap: 4px; padding-left: 8px; padding-right: 8px; }
   .cbtn { width: 32px; height: 32px; font-size: 17px; }
+  .cbtn svg { width: 20px; height: 20px; }
   .composer .primary { padding: 9px 12px; }
+  .hold-talk { width: 58px; height: 58px; }
 }
 
 /* ---------------------------- 录音浮层 ---------------------------- */
@@ -877,7 +1069,9 @@ button { cursor: pointer; }
 .ring {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  /* 必须高过全屏通话界面（z-index 70）——虽然通话中不会再来电，
+     但「来电浮层被通话界面盖住」这种事一旦发生就是致命且难查的 */
+  z-index: 90;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -901,7 +1095,13 @@ button { cursor: pointer; }
   border-radius: 50%;
   background: color-mix(in srgb, var(--accent) 14%, var(--surface));
   font-size: 26px;
+  color: var(--accent);
 }
+.ring-avatar svg { width: 26px; height: 26px; display: block; }
+/* 来电浮层按通话类型换图标：语音是话筒、视频是摄像机 */
+.ring-avatar .i-video { display: none; }
+#ring.kind-video .ring-avatar .i-audio { display: none; }
+#ring.kind-video .ring-avatar .i-video { display: block; }
 .ring-title { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
 .ring-sub { margin: 0 0 16px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
 .ring-actions { display: flex; gap: 10px; }
@@ -932,6 +1132,7 @@ button { cursor: pointer; }
   color: #fff;
   font-size: 13px;
   text-align: center;
-  z-index: 20;
+  /* 永远在最上层：提示被任何一层盖住都等于没提示 */
+  z-index: 95;
   animation: rise .18s ease-out;
 }
