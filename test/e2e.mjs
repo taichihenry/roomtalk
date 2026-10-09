@@ -359,6 +359,44 @@ async function main() {
     /视频/.test(await B.eval('document.getElementById("ring-title").textContent')),
     await B.eval('document.getElementById("ring-title").textContent'));
 
+  // ⭐ 隐私底线：**「对方按了发起」不等于「我愿意接」**。未接听之前，他的音视频
+  //    一个字节都不该到我这儿（用户实际踩到过：还没接听就听见对方说话、还看到画面）。
+  //    这条必须**先等一拍再断言** —— 轨道若真会传过来，2.5 秒足够它到；否则断言会
+  //    因为「跑得比 ICE 快、轨道还在路上」而假绿。
+  await new Promise((r) => setTimeout(r, 2500));
+  check('对方未接听时，收不到他的任何音视频轨道',
+    await B.eval('__rt.remoteAudioTracks') === 0 && await B.eval('__rt.remoteVideoTracks') === 0,
+    { a: await B.eval('__rt.remoteAudioTracks'), v: await B.eval('__rt.remoteVideoTracks') });
+  check('未接听时远端画面不进播放元素（否则挂断后会定格在最后一帧）',
+    await B.eval('!document.getElementById("remote-video").srcObject'));
+  check('未接听时，接听方自己也没开麦（麦克风要等接听那一刻才开）',
+    await B.eval('__rt.media.audio') === false, await B.eval('__rt.media'));
+
+  // 发起方中途挂断：浮层必须消失，而且此后**即便硬点接听也不能接通** ——
+  // 否则会接通一通早已结束的电话，而对方那头的连接还在，能听见你说话。
+  await A.click('btn-hangup-call');
+  check('发起方挂断后，来电浮层立刻收掉',
+    await waitUntil(async () => (await B.eval('__rt.ringShown')) === false, 'B 收起来电浮层', 8000)
+      .then(() => true).catch(() => false), await B.eval('__rt.ringShown'));
+  check('挂断后两端都不在通话中',
+    await A.eval('__rt.inCall') === false && await B.eval('__rt.inCall') === false,
+    { a: await A.eval('__rt.callKind'), b: await B.eval('__rt.callKind') });
+  check('挂断后发起方的麦克风 / 摄像头真的松开了（设备指示灯必须灭）',
+    await A.eval('__rt.media.audio === false && __rt.media.video === false'),
+    await A.eval('__rt.media'));
+
+  await B.click('ring-accept');   // 浮层已经收起了，这里硬点一下接听入口
+  await new Promise((r) => setTimeout(r, 1500));
+  check('浮层收起后硬点「接听」也接不通，更不会把自己的麦克风推过去',
+    await B.eval('__rt.inCall') === false && await B.eval('__rt.media.audio') === false,
+    { call: await B.eval('__rt.callKind'), media: await B.eval('__rt.media') });
+
+  // 重新发起一次，让下面几节继续在「正在响铃」的状态上往下走
+  await A.click('btn-call-video');
+  await waitUntil(async () => (await A.eval('__rt.callRinging')) === true, 'A 重新进入呼叫', 12000);
+  await waitUntil(async () => await B.eval('__rt.ringShown'), 'B 再次收到通话请求', 12000);
+  check('重新发起后对方再次收到请求', await B.eval('__rt.ringShown') === true);
+
   await B.click('ring-accept');
   check('接听后浮层收起', await B.eval('__rt.ringShown') === false);
   // ⚠ 接听是异步的（要等 getUserMedia），click() 一返回就断言会拿到旧值 —— 必须等

@@ -335,6 +335,10 @@ const S = {
   audioBlocked: false, // 浏览器拦住了自动播放（表现为「听不到对方」）
   ringKind: null,      // 正在响的来电类型：'audio' | 'video' | null
   ringTimer: null,
+  // 这颗来电已经作废（对方挂断了 / 超时了）。接听流程里有 await，回来时要能发现
+  // 「其实已经黄了」，否则会接通一个早已结束的呼叫 —— 而对方那头的连接还在，
+  // 甚至能听见你说话。
+  ringGone: false,
 
   /* ---- 进行中的通话 ----
    * callKind 是「通话态」的**唯一真相**：媒体开关（media.*）只表示我这边
@@ -958,7 +962,9 @@ function buildPeerConnection(amCaller) {
   S.remoteStream = new MediaStream();
 
   // 本端已经开的麦克风/摄像头要跟着接进新连接（重连时全靠这一步）
-  if (S.localStream) {
+  // ⚠ 例外：呼叫还没被接听时不能挂 —— 那等于「还没被允许就开始推流」，
+  //    正是「对方没接听就听得见」那个 bug 的另一条入口（见 publishLocalTracks）。
+  if (S.localStream && !S.callRinging) {
     for (const track of S.localStream.getTracks()) pc.addTrack(track, S.localStream);
   }
 
@@ -980,14 +986,17 @@ function buildPeerConnection(amCaller) {
   };
 
   pc.ontrack = (ev) => {
-    const rv = $('remote-video');
     const [stream] = ev.streams;
     if (stream) {
-      if (rv.srcObject !== stream) rv.srcObject = stream;
+      S.remoteStream = stream;
     } else {
       S.remoteStream.addTrack(ev.track);
-      rv.srcObject = S.remoteStream;
     }
+    // ⚠ 还没接通就别放出来。对方在「来电中」时也可能把自己的轨道推过来，
+    //    未接听前既不该出声也不该出画 —— 「对方按了发起」不等于「我愿意接」。
+    //    先攒在 S.remoteStream 里，等接听那一刻由 attachRemoteStream() 接上。
+    if (!callLive()) return;
+    attachRemoteStream();
     // 一定要走 ensureRemotePlayback：静默 catch 会把「自动播放被拦」
     // 变成用户眼里的「对方没开麦」
     ensureRemotePlayback();
@@ -1673,10 +1682,17 @@ function sendCtl(obj) {
  * 如果标志位早于 offer 落地，对方可能先收到 media 状态、后收到轨道，中间那一下
  * 会短暂显示「对方开着麦但听不到」—— 虽然只闪一下，但正好是用户会截图来问的那种。
  */
-async function ensureMic() {
+/**
+ * 打开麦克风（幂等）。已经开过就直接置回 enabled，不再二次申请权限。
+ *
+ * `publish=false` 表示**只采集、先别发送**。呼叫发起方要用这个：他在等对方接听，
+ * 那段时间里绝不能把自己的声音推过去 —— 详见 publishLocalTracks() 的说明。
+ */
+async function ensureMic(publish = !S.callRinging) {
   if (S.micTrack) {
     S.micTrack.enabled = true;
     S.media.audio = true;
+    if (publish) publishLocalTracks();
     syncMediaUI(); syncStage(); pushMediaState();
     return true;
   }
@@ -1687,7 +1703,7 @@ async function ensureMic() {
     });
     S.micTrack = stream.getAudioTracks()[0];
     ensureLocalStream().addTrack(S.micTrack);
-    if (S.pc) S.pc.addTrack(S.micTrack, S.localStream);
+    if (publish) publishLocalTracks();
   } catch (e) {
     console.warn(e);
     toast(e && e.name === 'NotAllowedError'
@@ -1700,11 +1716,12 @@ async function ensureMic() {
   return true;
 }
 
-/** 打开摄像头（幂等）。 */
-async function ensureCam() {
+/** 打开摄像头（幂等）。`publish=false` 的含义同 ensureMic。 */
+async function ensureCam(publish = !S.callRinging) {
   if (S.camTrack) {
     S.camTrack.enabled = true;
     S.media.video = true;
+    if (publish) publishLocalTracks();
     const lv = $('local-video');
     lv.srcObject = S.localStream;
     lv.play().catch(() => { /* noop */ });
@@ -1720,10 +1737,7 @@ async function ensureCam() {
     const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(S.facing) });
     S.camTrack = stream.getVideoTracks()[0];
     ensureLocalStream().addTrack(S.camTrack);
-    if (S.pc) {
-      S.pc.addTrack(S.camTrack, S.localStream);
-      tuneVideoSender(S.pc);   // addTrack 之后补设一次码率上限
-    }
+    if (publish) publishLocalTracks();
     const lv = $('local-video');
     lv.srcObject = S.localStream;
     lv.play().catch(() => { /* noop */ });
@@ -2029,6 +2043,12 @@ async function toggleCam() {
  */
 async function ensureRemotePlayback() {
   const rv = $('remote-video');
+  // ⚠ 手上没有可播的轨道时**不要**调 play()：对空流它返回的是一个永远 pending 的
+  // promise，会把调用方一直吊在那儿。接听流程就差点栽在这里 —— 对方接听时我们还没
+  // 开始推流（要等他回 ring-answer），他的 <video> 是个空流，play() 一挂起，
+  // ring-answer 就发不出去，于是双方互等成死锁。没东西可放就直接收工，
+  // 等轨道真到了 ontrack 会再调一次这个函数。
+  if (!rv.srcObject || rv.srcObject.getTracks().length === 0) return;
   try {
     await rv.play();
     setAudioBlocked(false);
@@ -2158,8 +2178,11 @@ function endCall(o = {}) {
 
 /** 对方挂断了 */
 function onBye() {
-  if (!inCall()) return;
-  endCall({ silent: true, note: '对方已挂断通话' });
+  if (inCall()) { endCall({ silent: true, note: '对方已挂断通话' }); return; }
+  // 呼叫还没被接听时对方就撤了 → 把来电浮层收掉。
+  // ⚠ 不收掉的后果很具体：浮层一直挂在那儿，用户过一会儿点「接听」，会接通一通
+  //    早已结束的电话 —— 而对方那头的连接还在，能听见你说话（用户实际遇到过）。
+  if (S.ringKind) { dismissRing(true); notice('对方已取消通话'); }
 }
 
 /**
@@ -2181,14 +2204,22 @@ async function startCall(kind) {
   // 自动化脚本、无障碍工具、以及各种边角时序都可能绕过界面。
   if (inCall()) { toast('正在通话中，请先挂断'); return; }
   if (S.ringKind) { toast('对方正在来电，请先接听或拒绝'); return; }
+  if (S.callRinging) return;   // 手上这次呼出还没走完，别并发再来一次
 
-  const okMic = await ensureMic();
-  if (!okMic) return;
+  // ⚠ 先把「呼叫中」标上，再去开设备：ensureMic/ensureCam 期间会 pushMediaState()，
+  // 而那时绝不能把「我开麦了 / 开摄像头了」播给对方 —— 他还没接听，甚至还没收到
+  // ring。publishLocalTracks() 与 buildPeerConnection() 那道闸门也看这个标志。
+  S.callRinging = true;
+
+  // 只采集、先不发送（publish=false）：既能在发起的当下就暴露权限问题、让本地
+  // 预览可用，又不会在对方接听之前把音视频推过去（那是隐私事故，见 publishLocalTracks）。
+  const okMic = await ensureMic(false);
+  if (!okMic) { S.callRinging = false; return; }
   if (kind === 'video') {
     // 摄像头拿不到就别开视频通话：对面看到的会是一个「视频通话却只有一方有
     // 画面」的怪界面，不如直接把话说清楚
-    const okCam = await ensureCam();
-    if (!okCam) { stopLocalMedia(); return; }
+    const okCam = await ensureCam(false);
+    if (!okCam) { stopLocalMedia(); return; }   // stopLocalMedia 会把呼叫标志一并复位
   }
 
   // 上面两个 await 期间用户可能又点了另一颗按钮 —— 再确认一次
@@ -2218,6 +2249,7 @@ function onRing(m) {
   }
 
   S.ringKind = kind;
+  S.ringGone = false;   // 新的一颗来电，作废标志清掉
   $('ring').className = 'ring' + (kind === 'video' ? ' kind-video' : '');
   $('ring-title').textContent = `对方想和你${kind === 'video' ? '视频' : '语音'}通话`;
   $('ring-sub').textContent = (m.name ? `对方设备：${m.name}\n` : '')
@@ -2225,35 +2257,57 @@ function onRing(m) {
   $('ring').hidden = false;
   clearTimeout(S.ringTimer);
   S.ringTimer = setTimeout(() => {
-    dismissRing();
+    dismissRing(true);   // 超时 = 这颗来电作废
     notice('对方发起过通话，你没接到');
   }, 30_000);
 }
 
-function dismissRing() {
+/**
+ * 收起来电浮层。
+ *
+ * `gone=true` 表示这颗来电**作废了**（对方挂断 / 超时），不只是「不显示了」——
+ * 接听流程里有 await，回到主流程时要能发现「其实已经黄了」并收手。
+ */
+function dismissRing(gone = false) {
   clearTimeout(S.ringTimer);
   S.ringTimer = null;
   S.ringKind = null;
+  S.ringGone = gone;
   $('ring').hidden = true;
 }
 
 async function acceptRing() {
   const kind = S.ringKind;
+  // 来电可能已经作废（对方挂断 / 超时）—— 这时绝不能接通
+  if (!kind) return;
   dismissRing();
-  const ok = await ensureMic();       // ← 这次点击就是「用户手势」，顺带解锁远端音频播放
+
+  // ⚠ 先只采集、不发送：万一对方恰在我们开麦的这几百毫秒里挂断了，
+  //    我们就不该把自己的声音推过去 —— 否则他会成为「接通了一通已结束的电话」
+  //    的听众（用户实际遇到过：浮层没消失，点接听后对方竟能听见自己）。
+  const ok = await ensureMic(false);       // ← 这次点击就是「用户手势」，顺带解锁远端音频播放
   if (!ok) { sendCtl({ t: 'ring-answer', kind, accept: false }); return; }
+  if (S.ringGone) { stopLocalMedia(); notice('对方已取消通话'); return; }
+
   if (kind === 'video') {
     // 摄像头没拿到就降级成语音接通，而不是把整通电话推掉 —— 至少还能说上话
-    const okCam = await ensureCam();
+    const okCam = await ensureCam(false);
     if (!okCam) toast('摄像头没打开，已按语音通话接通');
+    if (S.ringGone) { stopLocalMedia(); notice('对方已取消通话'); return; }
   }
-  await ensureRemotePlayback();
+
+  // 这颗来电确认有效 → **先回执**：对面正等着这条消息才会开始推流，所以它排在
+  // 最前面，不能被后面任何一步拖住（播放、摆界面都不该挡它的路）。
   sendCtl({ t: 'ring-answer', kind, accept: true });
+  publishLocalTracks();     // 这一刻才正式出声
   beginCall(kind === 'video' && S.media.video ? 'video' : 'audio', false);
   S.callStartedAt = Date.now();
   startCallTimer();
   updateCallHead();
   notice('已接听');
+  // 画面播放放最后：它只决定「此刻看不看得见」，接不通话不该赖它
+  attachRemoteStream();
+  ensureRemotePlayback();
 }
 
 function declineRing() {
@@ -2267,6 +2321,9 @@ function onRingAnswer(m) {
   if (m.accept) {
     if (!inCall()) return;
     S.callRinging = false;
+    // ⚠ 对方接听的那一刻，才是我们「开始发送」的时刻。整段呼叫期间我们的音视频
+    //    都只停在本地（publish=false 采的），对方一点「接听」才推过去。
+    publishLocalTracks();
     S.callStartedAt = Date.now();
     startCallTimer();
     clearTimeout(S.callOutTimer);
@@ -2275,11 +2332,52 @@ function onRingAnswer(m) {
     pushMediaState();      // 呼叫期间刻意没报状态，现在正式接通了补一次
     notice('对方已接听');
     toast('已接通');
+    // 播放放最后：对方也可能在我们还在响铃时就推了轨道过来（他是主动接听的一方），
+    // 那时 ontrack 只攒着没播 —— 现在补上。它只影响看不看得见，不该挡住上面几步。
+    attachRemoteStream();
+    ensureRemotePlayback();
     return;
   }
   // 对方拒绝：这边也收干净，否则麦克风一直开着、界面一直挂着「正在呼叫」
   if (inCall()) endCall({ silent: true, note: '对方拒绝了通话请求' });
   toast('对方拒绝了这次通话');
+}
+
+/**
+ * 把本地采到的轨道真正挂进 PC —— 也就是**开始发送**。
+ *
+ * ⚠ 这一动作必须和「采集」分开，而且要**等对方接听之后**才做。
+ *
+ * 之前的写法是 ensureMic/ensureCam 一拿到轨道就 addTrack，而 startCall 又在发出
+ * ring 之前就调它们 —— 于是「我按了发起」等于「我立刻开始往对面推流」：
+ * 对方**还没接听**就听得见我的声音、看得见我的画面；我中途挂断，他那边画面还
+ * 定格在最后一帧。对方点不点「接听」形同虚设，这是实打实的隐私事故。
+ *
+ * 现在：采集（ensureMic/ensureCam(publish=false)）≠ 发送（这个函数）。
+ * 只有在「对方接听了」或「我接听了」的那一刻才调它。
+ */
+function publishLocalTracks() {
+  // ⚠ 最后一道闸门。呼叫还没被接听时，无论谁调的（切换摄像头、开关麦克风、
+  //    重连重建 PC……）都不许把媒体推出去。
+  if (S.callRinging) return;
+  if (!S.pc || !S.localStream) return;
+  const have = new Set(S.pc.getSenders().map((s) => s.track).filter(Boolean));
+  for (const t of S.localStream.getTracks()) {
+    if (!have.has(t)) S.pc.addTrack(t, S.localStream);
+  }
+  tuneVideoSender(S.pc);   // addTrack 之后补设一次码率上限
+}
+
+/** 双方是否已经真正接通 —— 只有这时才该互相听/看。呼叫中、未接听都不算。 */
+function callLive() {
+  return inCall() && !S.callRinging;
+}
+
+/** 把远端流接到播放元素上。只在真正接通后调（见 publishLocalTracks 的说明）。 */
+function attachRemoteStream() {
+  const rv = $('remote-video');
+  if (!rv || !S.remoteStream) return;
+  if (rv.srcObject !== S.remoteStream) rv.srcObject = S.remoteStream;
 }
 
 function ensureLocalStream() {
@@ -2297,8 +2395,12 @@ function stopLocalMedia() {
   S.media = { audio: false, video: false };
   const lv = $('local-video');
   if (lv.srcObject) lv.srcObject = null;
+  // 远端画面也一并抹掉。不然挂断后那块 <video> 还留着最后一帧，
+  // 看上去就像「通话还在」——用户实际报过这个现象。
+  const rv = $('remote-video');
+  if (rv && rv.srcObject) rv.srcObject = null;
   setAudioBlocked(false);
-  dismissRing();
+  dismissRing(true);   // 走到这里说明这通（或这颗来电）已经作废
 
   // 通话态与布局一并复位。**挂在 stopLocalMedia 上而不是 endCall 上**：
   // 退出房间、被请出、对方离开……这些路径都会停媒体，但都不是「挂断」。
@@ -2622,6 +2724,10 @@ window.__rt = {
   get callKind() { return S.callKind; },
   get inCall() { return inCall(); },
   get callRinging() { return S.callRinging; },
+  /** 双方是否已经真正接通（可以互相听/看）。呼叫中、未接听时都是 false。 */
+  get callLive() { return callLive(); },
+  /** 这颗来电是否已经作废（对方挂断 / 超时） */
+  get ringGone() { return S.ringGone; },
   get callUiShown() { return !$('call-ui').hidden; },
   get callMode() { return $('room').classList.contains('call-mode'); },
   get callTimerText() { return $('call-timer').textContent; },
