@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 的可见范围。
+
+  ⚠ android 7.0 起，把 `file://` 的 URI 交给别的应用会直接抛
+    FileUriExposedException —— 所以「打开收到的文件」必须走 content:// 这条路。
+    这里只放出三个缓存子目录，不是整个 cacheDir，更不是外部存储：
+    FileProvider 是「我主动把这一个文件递给那个应用」，范围越小越不容易被滥用。
+
+  ⚠ name 是 URI 里的路径段（content://<authority>/recv/xxx），改成中文或带空格
+    会让某些接收方拼不出正确路径；保持纯 ASCII。
+-->
+<paths>
+    <!-- 收到的文件 / 语音 -->
+    <cache-path name="recv" path="recv/" />
+    <!-- 自己发出去的那份（发送前从内容提供器复制的本地副本） -->
+    <cache-path name="outbox" path="outbox/" />
+    <!-- 自己录的语音 -->
+    <cache-path name="voice" path="voice/" />
+</paths>

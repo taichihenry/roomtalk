@@ -49,8 +49,33 @@ import kotlin.coroutines.resumeWithException
  *
  * ② **通话态判据只看 callKind，不看有没有轨道。** 视频通话里关摄像头，轨道还在、
  *    只是 disabled —— 拿「有没有视频轨」判断「是否在通话」会在那一刻集体错乱。
+ *
+ * ③ **WebRTC 的回调一律不在主线程上。** `PeerConnection.Observer` 在 signaling
+ *    线程派发、`DataChannel.Observer` 在 network 线程派发，而它们往上走
+ *    （onConnectionChange / onRemoteTrack / onDcMessage / onChannelReady…）
+ *    最后几乎都会去改 TextView、动 SurfaceViewRenderer —— 那是**只有主线程**能做的事。
+ *
+ *    越界的后果不是普通的闪退。Android 抛 CalledFromWrongThreadException，它从 JNI
+ *    回调里逃出去时会被 WebRTC 的 `sdk/android/src/jni/jvm.cc` 当成致命错误直接
+ *    abort 整个进程：
+ *
+ *        Fatal error in: ../../../sdk/android/src/jni/jvm.cc, line 81
+ *        Check failed: false
+ *        libc: Fatal signal 6 (SIGABRT) in tid ... (signaling_threa)
+ *
+ *    这是 **native 崩溃**，Java 层的 try/catch 和 UncaughtExceptionHandler 一个都
+ *    接不到（v1.0.1 加的那套崩溃兜底对它完全无效）。所以下面**每一个** native
+ *    回调都套了 [main].post —— 新增回调时不许省。
  */
 class PeerEngine(private val context: Context) {
+
+    /**
+     * 把 native 回调送回主线程。见类注释③ —— 这不是「顺手优化」，是保命的。
+     *
+     * 刻意用全限定名而不 import：文件末尾对 CoroutineScope 也是这么写的，
+     * 少两行 import 就少一分将来被误删的可能。
+     */
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
 
     /** 对端轨道到了 —— 是否接进渲染器由上层按通话态决定（未接通时只攒着）。 */
     var onRemoteTrack: (() -> Unit)? = null
@@ -59,8 +84,18 @@ class PeerEngine(private val context: Context) {
     var onLocalSdp: ((type: String, sdp: String) -> Unit)? = null
     var onLocalIce: ((IceCandidate) -> Unit)? = null
 
-    /** DataChannel 上的文本消息（已解析为字符串，二进制分片本版忽略）。 */
+    /** DataChannel 上的文本消息（控制消息：msg / media / ring / xfer ctl…）。 */
     var onDcMessage: ((String) -> Unit)? = null
+
+    /**
+     * DataChannel 上的**二进制**分片（文件 / 语音的正文）。
+     *
+     * 与文本一样切回主线程再回调 —— 这不是「顺手」，是为了**保序**：
+     * 文本走 `main.post`，二进制若在别处就地处理，两者就会落到两条队列上，
+     * 接收端会出现「分片先到、begin 后到」的错位（状态机还没建好就收数据）。
+     * 两条都进主线程队列，FIFO 天然把顺序固定住。
+     */
+    var onDcBinary: ((ByteArray) -> Unit)? = null
     var onDcOpen: (() -> Unit)? = null
     var onDcClosed: (() -> Unit)? = null
 
@@ -576,24 +611,61 @@ class PeerEngine(private val context: Context) {
         }
     }
 
+    /**
+     * 发一个二进制分片。`binary = true` 这个标志必须给对 —— 给成 false，对端会按
+     * UTF-8 去解，收到一堆乱码，而且**不会报任何错**。
+     *
+     * ⚠ 与 [sendDc] 一样，调用方必须在主线程。分片正文不经 native 复用，
+     *   但保持「发送全在主线程」这条约定能让背压判定（[dcBufferedAmount]）
+     *   和发送顺序都不必再去考虑竞态。
+     */
+    fun sendDcBinary(bytes: ByteArray): Boolean {
+        val c = dc ?: return false
+        return try {
+            c.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), true))
+        } catch (t: Throwable) {
+            Log.w(TAG, "二进制发送失败（${bytes.size}B）", t)
+            false
+        }
+    }
+
+    /**
+     * 数据通道里还没发出去的字节数 —— 传输时的背压依据。
+     *
+     * 为什么必须有：`send()` 不会阻塞，也不会有上限保护，一口气灌几十 MB
+     * 会把缓冲顶爆并抛错。发送方盯住这个值（超过高水位就等一等），
+     * 才能把大文件平稳推过去。
+     */
+    fun dcBufferedAmount(): Long = try {
+        dc?.bufferedAmount() ?: 0L
+    } catch (_: Throwable) {
+        0L
+    }
+
     private fun bindChannel(channel: DataChannel?) {
         val c = channel ?: return
         dc = c
         c.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(amount: Long) { }
+
             override fun onStateChange() {
-                if (c.state() == DataChannel.State.OPEN) onDcOpen?.invoke() else onDcClosed?.invoke()
+                // 状态在当前线程读掉，通知才回主线程 —— 见类注释③。
+                // 这个回调在 network 线程上，onDcOpen 会一路走到 cb.status()（改 TextView）。
+                val open = c.state() == DataChannel.State.OPEN
+                main.post { if (open) onDcOpen?.invoke() else onDcClosed?.invoke() }
             }
+
             override fun onMessage(buffer: DataChannel.Buffer) {
+                // ⚠ buffer 里的 ByteBuffer 由 native 复用：**必须在本线程就复制走**。
+                //   等回到主线程再读，读到的已经是后面某一条消息的内容了。
                 val data = buffer.data
                 val bytes = ByteArray(data.remaining())
                 data.get(bytes)
-                if (buffer.binary) {
-                    // 文件 / 语音分片。本版还没做接收，先明确记一笔，别静默丢弃。
-                    Log.i(TAG, "收到二进制分片 ${bytes.size}B（本版未处理）")
-                    return
+                val binary = buffer.binary
+                main.post {
+                    if (binary) onDcBinary?.invoke(bytes)
+                    else onDcMessage?.invoke(String(bytes, Charsets.UTF_8))
                 }
-                onDcMessage?.invoke(String(bytes, Charsets.UTF_8))
             }
         })
     }
@@ -672,7 +744,8 @@ class PeerEngine(private val context: Context) {
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) { }
 
         override fun onIceCandidate(candidate: IceCandidate?) {
-            candidate?.let { onLocalIce?.invoke(it) }
+            // IceCandidate 是普通 Java 对象，跨线程持有没问题（不是 native 复用的 buffer）
+            candidate?.let { c -> main.post { onLocalIce?.invoke(c) } }
         }
 
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) { }
@@ -682,18 +755,24 @@ class PeerEngine(private val context: Context) {
         override fun onRemoveStream(stream: MediaStream?) { }
 
         override fun onDataChannel(channel: DataChannel?) {
-            // 对端（主叫方）建的通道：这里必须接住，否则聊天永远不通
-            bindChannel(channel)
+            // 对端（主叫方）建的通道：这里必须接住，否则聊天永远不通。
+            // bindChannel 会写 [dc] 字段并注册观察者，统一放主线程做，免得和
+            // 主线程读 isChannelOpen 撞在一起。
+            if (channel == null) return
+            main.post { bindChannel(channel) }
         }
 
         override fun onRenegotiationNeeded() {
-            // 加轨道、改码率都会走到这里 —— 用协程串起来，避免并发协商
+            // 加轨道、改码率都会走到这里 —— 用协程串起来，避免并发协商。
+            // scope 挂在 Dispatchers.Main 上，launch 本身就完成了跨线程切换。
             scope.launch { negotiate() }
         }
 
         /** 对端加了轨道（新版 SDK 走这条）。这里不缓存轨道，只叫上层来取一次。 */
         override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
-            if (receiver?.track() is VideoTrack) onRemoteTrack?.invoke()
+            // ⚠ track() 必须在回调线程读（native 侧随时可能变）；读到的结论再回主线程通知
+            val isVideo = receiver?.track() is VideoTrack
+            if (isVideo) main.post { onRemoteTrack?.invoke() }
         }
 
         /**
@@ -707,11 +786,32 @@ class PeerEngine(private val context: Context) {
          *    所以这里只需要「叫一声」，不需要传任何东西。
          */
         override fun onTrack(transceiver: RtpTransceiver?) {
-            if (transceiver != null) onRemoteTrack?.invoke()
+            if (transceiver != null) main.post { onRemoteTrack?.invoke() }
         }
 
+        /**
+         * ⚠⚠ **这就是「点语音通话必闪退」的那个崩点。**
+         *
+         * 本回调在 signaling 线程上派发（线程名 `signaling_threa` —— 15 字符被截断，
+         * 与启动时的 `onSignalingThreadReady` 是同一个 tid）。它往上走：
+         *
+         *     onConnectionChange → RoomSession.onConnState → cb.status()
+         *       → MainActivity.status() → TextView.setText()
+         *       → ViewRootImpl.checkThread() → CalledFromWrongThreadException
+         *       → 穿出 JNI → WebRTC jvm.cc 的 CHECK(false) → abort() → SIGABRT
+         *
+         * 实测崩溃现场（华为 nova 5 Pro / Android 10 / v1.0.1）：
+         *
+         *     11:23:37.520 18776 18928 I RoomTalk.Session: 连接状态: CONNECTED
+         *     11:23:37.549 18776 18928 W System.err: CalledFromWrongThreadException
+         *     11:23:37.550 18776 18928 E rtc: Fatal error in ... jvm.cc, line 81
+         *     11:23:37.551 18776 18928 F libc: Fatal signal 6 (SIGABRT)
+         *
+         * 之所以「进房间不崩、一发起通话才崩」：PeerConnection 是通话时才建的，
+         * 状态回调自然也只有那时才开始来。
+         */
         override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
-            newState?.let { onConnectionChange?.invoke(it) }
+            newState?.let { s -> main.post { onConnectionChange?.invoke(s) } }
         }
 
         override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent?) { }

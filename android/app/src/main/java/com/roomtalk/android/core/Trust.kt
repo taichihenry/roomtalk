@@ -1,6 +1,7 @@
 package com.roomtalk.android.core
 
 import android.content.Context
+import android.util.Log
 import java.util.UUID
 
 /**
@@ -41,6 +42,29 @@ class Trust(context: Context) {
         return v
     }
 
+    /**
+     * 信令连接身份。服务端拿它认出「这是你自己上一次的那条连接」。
+     *
+     * ⚠ **必须持久化，而且必须与 [deviceId] 分开**：
+     *
+     *   · 持久化 —— 服务端在房间满时会先踢掉「clientId 与自己相同」的旧连接
+     *     （见 cloudflare/src/room.js 的 _join）。若每次进程重启都换一个随机串，
+     *     这套机制永远不会触发：崩溃 / 强杀留下的半死连接（TCP 假死，readyState
+     *     仍是 1）会一直占着 2 人房的名额，用户明明一个人，却被回一句
+     *     「这个口令已经被两个人占用了」。网页端的等价物是 sessionStorage 的 rt.cid。
+     *
+     *   · 分开 —— clientId 是明文交给**服务器**的；deviceId 是给**对端**看的名片。
+     *     两者一旦共用，服务器就能把「哪条连接」和「哪台设备」对上号。对一个
+     *     卖点就是「服务器不知道你们是谁」的产品，这是白送的额外信息，不该给。
+     */
+    fun clientId(): String {
+        val cur = sp.getString(KEY_CID, null)
+        if (!cur.isNullOrBlank()) return cur
+        val v = UUID.randomUUID().toString()
+        sp.edit().putString(KEY_CID, v).apply()
+        return v
+    }
+
     /** 这个房间里我记住的那台设备（null = 第一次）。 */
     fun trusted(room: String): String? = sp.getString("trust.$room", null)
 
@@ -72,6 +96,31 @@ class Trust(context: Context) {
     }
 
     /**
+     * 把这个房间留在本机的东西全部抹掉。
+     *
+     * 口令是共享秘密，而房间号是它的派生值 —— 同一串口令永远落到同一间房，也就
+     * 永远落到同一组 `trust.<room>` / `block.<room>` 上。于是「上一拨人用完走了、
+     * 下一拨人拿同一口令开房」时，后来的人会踩到前一拨人的记忆：轻则把熟人认成
+     * 陌生人，重则让一台素不相识的设备因为落在旧黑名单里被**自动请出**（对方只会
+     * 看到自己莫名其妙被踢）。
+     *
+     * ⚠ 只清**按房间**的那两条。[deviceId]、[clientId]、[autoKick] 都是**设备级**的，
+     *   跟进哪个房间无关 —— 一并清掉等于让设备改名，反倒会给对方制造
+     *   「对方换了一台设备」的误报。
+     *
+     * 代价是明确的、也已确认过：「记住这台设备」的跨会话保护随之失效，下次进同一个
+     * 房间会被当作第一次见。隐私优先的取舍。
+     */
+    fun wipeRoom(room: String) {
+        if (room.isBlank()) return
+        sp.edit().remove("trust.$room").remove("block.$room").apply()
+        // 留一行日志**不是为了调试、是为了能被验证**：这条路径（离房清空）在真机上
+        // 只能靠日志看到它真的跑了 —— 界面上的效果是「什么都没发生」。
+        // 出了「我怎么又把你当陌生人了」这种反馈时，也能一眼确认是不是这条路径导致的。
+        Log.i(TAG, "已清除本房间的记忆 room=${room.take(8)}…")
+    }
+
+    /**
      * 「自动请出」。默认开 —— 防的是「被请出去的人又摸回来」。
      * 误请过人之后可以关掉，把对方放回来。
      */
@@ -82,7 +131,9 @@ class Trust(context: Context) {
         }
 
     private companion object {
+        const val TAG = "RoomTalk.Trust"
         const val KEY_DID = "did"
+        const val KEY_CID = "cid"
         const val KEY_AUTOKICK = "autokick"
         const val MAX_BLOCK = 20
     }

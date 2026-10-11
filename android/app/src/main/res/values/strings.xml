@@ -3,6 +3,8 @@
 
     <string name="lede">和对方输入同一串口令，即可接通。</string>
     <string name="pass_hint">输入你们的暗号</string>
+    <string name="pass_show">显示</string>
+    <string name="pass_hide">隐藏</string>
     <string name="enter">进入</string>
     <string name="gate_hint">口令只在你手机上参与计算，服务器只收到一串随机房间号，不知道你们的暗号是什么。</string>
 
@@ -16,6 +18,29 @@
     <string name="send">发送</string>
     <string name="call_audio">语音通话</string>
     <string name="call_video">视频通话</string>
+
+    <!-- 输入栏里的两颗新键 + 按住说话 -->
+    <string name="to_voice">切换到语音</string>
+    <string name="to_keyboard">切换到键盘</string>
+    <string name="attach">发送文件</string>
+    <string name="hold_to_talk">按住 说话</string>
+    <string name="release_to_send">松手 发送</string>
+    <string name="release_to_cancel">松手 取消</string>
+    <string name="rec_hint">松手发送 · 上滑取消</string>
+    <string name="rec_cancel_hint">松手取消</string>
+    <string name="voice_too_short">说话时间太短，已取消</string>
+    <string name="voice_play">播放语音</string>
+    <string name="voice_cannot_play">这条语音这台设备放不了，可以先另存下来</string>
+    <string name="pick_file">选一个要发的文件</string>
+    <string name="send_failed">这条没发出去</string>
+    <string name="xfer_save_as">另存为</string>
+    <string name="xfer_open">用其他应用打开</string>
+    <string name="xfer_actions">这个文件</string>
+    <string name="xfer_open_failed">这台设备没有能打开它的应用</string>
+    <string name="xfer_save_failed">保存失败</string>
+    <string name="xfer_saved">已保存</string>
+    <string name="xfer_copy_path">复制文件路径</string>
+    <string name="xfer_too_big">超过 100MB 上限，换个小点的</string>
 
     <string name="mic">麦克风</string>
     <string name="cam">摄像头</string>

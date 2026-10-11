@@ -1128,6 +1128,46 @@ async function main() {
   check('原房主连「请出房间」按钮都看不到', await A.eval('__rt.kickBtnShown') === false);
   check('新房主依然持有权限', await B.eval('__rt.isHost') === true);
 
+  /* ------------------- 10. 房间腾空即清空（内容与记忆都不留） ------------------- */
+  section('10. 房间腾空：本机不留内容，也不留记忆');
+
+  /*
+   * ⚠ 这一节必须**自己把要验的状态造出来**，不能指望上一节留下什么。
+   *
+   * 第一版就是这么写的，结果两条断言挂了 —— 而挂的原因恰恰是**功能正常**：
+   * 上一节里 A 中途退出过房间，那次退出已经按新规矩把 A 的房间记忆清掉了，
+   * 于是「退房前 A 侧确实记着信任记录」不成立。一个「靠别人的残留做前提」的
+   * 测试，在功能生效之后必然会以最误导的方式亮红。
+   */
+  const roomId = await A.eval('sessionStorage.getItem("rt.room")');
+  check('此刻两端都在房间里（同一次会面，房间号一致）',
+    !!roomId && (await B.eval('sessionStorage.getItem("rt.room")')) === roomId);
+
+  // 造内容：发一条消息，聊天区就有东西可清了
+  await A.type('这条消息用来验证退房后不会留下');
+  const hasMsg = await waitUntil(async () =>
+    (await A.eval('document.getElementById("log").children.length')) > 0, 'A 聊天区有内容', 12000)
+    .then(() => true).catch(() => false);
+  check('退房前聊天区里确实有内容（有话可清）', hasMsg);
+
+  // 造记忆：点一下「记住这台设备」。此刻 A 对该房间没有记忆（上一节退出时清掉了），
+  // 所以提示条停在「第一次」态，这个按钮是可见的 —— 走界面点，别去直接写 localStorage，
+  // 那样测的就不是用户真会走的那条路了。
+  // 先等对方的设备名片确实到了，否则那个按钮的处理器会因为「还没拿到对方标识」直接返回。
+  await waitUntil(async () => !!(await A.eval('__rt.peerDeviceId')), 'A 拿到对方设备标识', 15000)
+    .then(() => {}).catch(() => {});
+  await A.click('trust-keep');
+  check('退房前 A 侧确实记着这间房的信任记录',
+    (await A.eval('Object.keys(localStorage)')).includes('rt.trust.' + roomId),
+    await A.eval('Object.keys(localStorage).sort()'));
+
+  // 顺手在 B 侧埋一条**伪造的陈旧拉黑记录**，模拟「上一拨人在这间房用过、留下了名单」。
+  // 这是所有陈旧记忆里最会伤人的一条：新房客撞上旧名单会被自动请出去，
+  // 而且被请的人完全不知道自己踩了什么。
+  await B.eval(`localStorage.setItem('rt.block.${roomId}', '["stale-device"]'), true`);
+  check('B 侧已埋入一条陈旧拉黑记录（用来验它确实会被清掉）',
+    await B.eval(`localStorage.getItem('rt.block.${roomId}')`) === '["stale-device"]');
+
   // 两个人都退出，房间（也就是这个口令的占用）才真正腾空
   await B.eval('document.getElementById("btn-hangup").click(), true');
   await A.eval('document.getElementById("btn-hangup").click(), true');
@@ -1135,6 +1175,41 @@ async function main() {
   check('两人都退出后都回到了入口',
     await A.eval('!document.getElementById("gate").hidden') === true &&
     await B.eval('!document.getElementById("gate").hidden') === true);
+
+  const keysA = await A.eval('Object.keys(localStorage).sort()');
+  const keysB = await B.eval('Object.keys(localStorage).sort()');
+  const roomKeys = (ks) => ks.filter((k) => k.startsWith('rt.trust.') || k.startsWith('rt.block.'));
+  check('A 退房后，这间房的信任/拉黑记忆全部消失', roomKeys(keysA).length === 0, roomKeys(keysA));
+  check('B 退房后也一样（埋进去的那条陈旧拉黑一起清掉）', roomKeys(keysB).length === 0, roomKeys(keysB));
+  check('设备身份 rt.did 必须留着（清了会让对方误报「对方换了一台设备」）',
+    keysA.includes('rt.did'), keysA);
+  check('设备级偏好也留着（「自动请出」是这台设备的设定，不跟房间走）',
+    keysA.includes('rt.autokick'), keysA);
+  check('A 退房后聊天区被清空（消息 / 语音 / 文件一起走）',
+    await A.eval('document.getElementById("log").children.length') === 0);
+  check('B 那端的聊天区也清空了',
+    await B.eval('document.getElementById("log").children.length') === 0);
+
+  /*
+   * 自愈那一条。
+   *
+   * 直接关标签页 / 杀掉应用的人根本不会走「退房」这条路，靠退房触发的清理在这些
+   * 最常见的离场方式下一次都不会执行 —— 记忆会一直留着。所以进房时还有一道自查：
+   * host=true 说明这间房是我进来才建起来的，也就是我进来之前它是空的，那它在本机
+   * 就不该还留着记忆。
+   */
+  await A.eval(`localStorage.setItem('rt.trust.${roomId}', 'stale-device'), true`);
+  await A.enter(PASSPHRASE);
+  const soloHost = await waitUntil(async () => (await A.eval('__rt.isHost')) === true, 'A 独自进房', 25000)
+    .then(() => true).catch(() => false);
+  check('A 独自进房（说明这间房此前确实被腾空了）', soloHost, await A.eval('__rt.status'));
+  check('进空房时陈旧记忆被自愈抹掉，不会带进新的一次会面',
+    await A.eval(`localStorage.getItem('rt.trust.${roomId}')`) === null,
+    await A.eval(`localStorage.getItem('rt.trust.${roomId}')`));
+
+  // 收摊：把 A 也退出来，别让这间房在测试结束后还被人占着
+  await A.eval('document.getElementById("btn-hangup").click(), true');
+  await sleep(600);
 
   /* ---------------------------- 结果 ---------------------------- */
   console.log('\n' + '─'.repeat(56));

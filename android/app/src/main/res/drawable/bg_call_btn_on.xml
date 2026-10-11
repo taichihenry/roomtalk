@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通话按钮的「开」态：实心绿底 + 白图标。
+
+  和 bg_call_btn_off（实心红底）成对，做法和挂断那颗（bg_call_btn_danger）完全一致 ——
+  整排按钮长成同一个family：**底色说状态，图标只说功能**。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="@color/call_on" />
+</shape>

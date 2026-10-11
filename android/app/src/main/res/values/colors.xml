@@ -12,6 +12,18 @@
     <color name="danger">#D9534F</color>
     <color name="ok">#1F9D55</color>
 
+    <!--
+      通话按钮的开关色：开 = 绿，关 = 红（对齐微信的观感）。
+
+      底色承担状态、图标恒为白色（见 bg_call_btn_on / bg_call_btn_off）。
+      早先试过「只染图标、底保持描边」，在真机上根本读不出来：图标是细笔画，
+      视频画面一亮就糊成一片；而整块填色盖在任何背景上都能分辨。
+      色号直接取微信那两个（#07C160 / #FA5151），不另调 —— 用户对这两档颜色的
+      含义已经有肌肉记忆，换一个「差不多的绿」只会让人重新学一遍。
+    -->
+    <color name="call_on">#07C160</color>
+    <color name="call_off">#FA5151</color>
+
     <!-- 自适应图标背景层（与网站 favicon 的蓝一致） -->
     <color name="ic_launcher_background">#2F6DF6</color>
 </resources>

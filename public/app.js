@@ -264,6 +264,28 @@ function clearBlocked(room) {
   try { localStorage.removeItem(blockKey(room)); } catch { /* noop */ }
 }
 
+/**
+ * 把这个房间留在本机的东西全部抹掉。
+ *
+ * 为什么必须由**离开房间**来触发：口令是共享秘密，而房间号是口令的派生值 ——
+ * 同一串口令永远落到同一个 roomId，也就永远落到同一组 `rt.trust.<room>` /
+ * `rt.block.<room>` 上。于是「上一拨人用完走了、下一拨人拿同一口令开房」时，
+ * 后来的人会踩到前一拨人的记忆：轻则把熟人认成陌生人，重则让一台素不相识的
+ * 设备因为落在旧黑名单里被**自动请出去**（对方只会看到自己莫名其妙被踢）。
+ *
+ * ⚠ 只清**按房间**的那几条。`rt.did`（这台设备是谁）、`rt.cid`（服务端认自己
+ *   那条旧连接用）、`rt.autokick`、`rt.quality` 都是**设备级**的，跟进哪个房间
+ *   无关 —— 一并清掉等于让设备改名，反而会给对方制造「对方换了一台设备」的误报。
+ *
+ * 代价是明确的、也已经确认过：「记住这台设备」的跨会话保护随之失效，下次进同一
+ * 个房间会被当作第一次见。这是隐私优先的取舍。
+ */
+function wipeRoomMemory(room) {
+  if (!room) return;
+  try { localStorage.removeItem(trustKey(room)); } catch { /* 隐私模式下不可用 */ }
+  clearBlocked(room);
+}
+
 /*
  * 「自动请出」开关（只有房主用得上）。
  *
@@ -304,6 +326,7 @@ const S = {
   ignoreOffer: false,
   settingAnswer: false,
   isHost: false,        // 我是不是房主（第一个进房的人）—— 只有房主能请人出去
+  hostWipeDone: false,  // 本次进房是否已做过「这间房是不是空的」自查（见 room-joined）
   autoKick: true,       // 房主专属：黑名单设备再进来时是否自动请走（见 AUTOKICK_KEY）
   myName: '',           // 我这台设备的设备名（进房时上报给对端）
   peerName: '',         // 对端的设备名
@@ -386,24 +409,45 @@ function setStatus(kind, text) {
   $('status').textContent = text;
 }
 
+/**
+ * 摘掉一个气泡时顺手把它挂着的资源也放掉。
+ *
+ * blob: URL 不 revoke 的话，那个 Blob 会被一直引用着不放 —— 一条 30MB 的文件
+ * 就是一个 30MB 的内存；语音条还得先 pause，从 DOM 里摘掉并不会让 <audio> 停声，
+ * 正在播的那条会变成「看不见却还在响」。
+ */
+function releaseBubble(el) {
+  const audio = el.querySelector && el.querySelector('audio');
+  if (audio && !audio.paused) { try { audio.pause(); } catch { /* noop */ } }
+  const a = el.querySelector && el.querySelector('audio, a[download]');
+  const url = a && (a.src || a.href);
+  if (url && url.startsWith('blob:')) { try { URL.revokeObjectURL(url); } catch { /* noop */ } }
+}
+
 function appendToLog(el) {
   const log = $('log');
   log.appendChild(el);
   // 长时间通话时限制 DOM 数量：没人会往上翻几百条，多留只是白占内存、拖慢渲染
   while (log.children.length > MAX_MESSAGES) {
-    const old = log.firstElementChild;
-    // 淘汰语音条时先把播放停掉：从 DOM 里摘掉并不会让 <audio> 停止发声，
-    // 正在播的那条会变成「看不见却在响」
-    const audio = old.querySelector && old.querySelector('audio');
-    if (audio && !audio.paused) { try { audio.pause(); } catch { /* noop */ } }
-    // 语音/文件气泡里挂着 blob: URL，撤掉 DOM 的同时必须 revoke，
-    // 否则那几十 MB 的 Blob 会被一直引用着不放
-    const a = old.querySelector && old.querySelector('audio, a[download]');
-    const url = a && (a.src || a.href);
-    if (url && url.startsWith('blob:')) { try { URL.revokeObjectURL(url); } catch { /* noop */ } }
-    log.removeChild(old);
+    releaseBubble(log.firstElementChild);
+    log.removeChild(log.firstElementChild);
   }
   scrollLog();
+}
+
+/**
+ * 把聊天区彻底清空。**离房时调**。
+ *
+ * 这是「房间腾空了，这个房间在本机不留内容」那句承诺的落地：房间视图离房后只
+ * 是被 hidden 起来，内容还原封不动躺在页面上 —— 同一台设备（或者借用这台设备
+ * 的人）拿同一串口令再开一次房，那批消息、语音、文件明明还在。光把 DOM 摘掉还
+ * 不够，气泡里的 blob: URL 得 revoke，否则字节照样活在内存里。
+ */
+function clearLogView() {
+  const log = $('log');
+  for (const el of [...log.children]) releaseBubble(el);
+  log.innerHTML = '';
+  lastMsgAt = 0;   // 时间分隔的节流状态一起复位，否则下个房间的第一条消息不带时间
 }
 
 /*
@@ -658,6 +702,8 @@ function enterRoom(roomId) {
   S.room = roomId;
   S.started = true;
   S.leaving = false;
+  // 新的一次进房，重置「已检查过这间房是不是空的」标记（见 room-joined）
+  S.hostWipeDone = false;
   if (!S.myName) S.myName = guessDeviceName().slice(0, 24);
   S.peerName = '';
   $('gate').hidden = true;
@@ -681,6 +727,8 @@ function backToGate() {
   S.ws = null;
   teardownPeer();
   stopLocalMedia();
+  // 这个房间在本机不留内容：消息气泡、语音、文件，连同它们挂着的 blob 一起放掉
+  clearLogView();
   sessionStorage.removeItem('rt.room');
   $('room').hidden = true;
   $('stage').hidden = true;
@@ -808,6 +856,17 @@ function handleServerMessage(m) {
       // 房主身份由服务端判定：第一个进房的人是房主，只有他能请人出去。
       // 「谁先退出谁让位」—— 所以这行也可能是 host=false。
       S.isHost = !!m.host;
+      // host=true 意味着这间房是**我这次进来才建起来的** —— 也就是我进来之前它是空的，
+      // 说明上一拨人早就散了。按「房间腾空即清空」的规矩，这间房在本机不该还留着记忆。
+      //
+      // 为什么要有这道自愈：靠「离开房间」触发的那次清理，在**直接关掉标签页 / 崩溃 /
+      // 断网变僵尸**这些最常见的离场方式下根本不会执行，那些记忆会一直留着，直到某天
+      // 一台毫不相干的设备撞上旧黑名单被自动请出去。只在每次进房的第一条 room-joined
+      // 上做一次，重连时不会碰（重连不经过 enterRoom，这个标记也就不会被重置）。
+      if (S.isHost && !S.hostWipeDone) {
+        S.hostWipeDone = true;
+        wipeRoomMemory(S.room);
+      }
       setStatus('waiting', '等待对方接入');
       reflectHostUI();
       break;
@@ -857,6 +916,8 @@ function handleServerMessage(m) {
       S.kickedCount++;
       teardownPeer();
       S.remotePeerId = null;
+      // 被请出去 = 这一次会面到此为止，房间的记忆一并不留（见 wipeRoomMemory）
+      wipeRoomMemory(S.room);
       failToGate('对方把你请出了这个房间');
       break;
 
@@ -1435,7 +1496,26 @@ function pushMediaState() {
  */
 function pickAudioMime() {
   if (!window.MediaRecorder) return '';
-  const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  /*
+   * ⚠ 顺序是**刻意**把 mp4/aac 排在 webm/opus 前面的。
+   *
+   * 直觉上应该优先 opus（同码率下音质更好、体积更小），但这门语言不止两个浏览器
+   * 在说：安卓那个原生 App 只有 MediaRecorder 的一套 AAC 编码器，能放什么则要看
+   * 系统内置解码器 —— Opus 在 webm 容器里要到 Android 10 才进 AOSP，而在华为这类
+   * 深度定制的 ROM 上并不保险。AAC/MP4 是**唯一两端都必然支持**的那一个格式：
+   * Chrome、Safari、安卓原生全都放得了。
+   *
+   * 代价是 web→web 时体积略大一点（64kbps 的 AAC 与 opus 差别有限），
+   * 换来的是「网页发来的语音，手机上点开就能听」——这笔账很划算。
+   *
+   * 后面的 webm/opus 与 ogg 是为「实在不支持 mp4 的浏览器」（主要是 Firefox）
+   * 留的降级路径：那种情况下 web↔web 依旧可用，只是发到安卓上可能放不出来。
+   */
+  const cands = [
+    'audio/mp4;codecs=mp4a.40.2', 'audio/mp4',
+    'audio/webm;codecs=opus', 'audio/webm',
+    'audio/ogg;codecs=opus',
+  ];
   for (const c of cands) {
     try { if (MediaRecorder.isTypeSupported(c)) return c; } catch { /* 继续试 */ }
   }
@@ -3051,6 +3131,8 @@ function boot() {
     if (inCall()) endCall();
     // 再告诉对方一声，让他那边立刻收到 peer-left 而不是等超时
     send({ type: 'leave', room: S.room });
+    // 房间的记忆不跟着我回家：同一口令的房间用完了就该是干净的（见 wipeRoomMemory）
+    wipeRoomMemory(S.room);
     backToGate();
   });
 

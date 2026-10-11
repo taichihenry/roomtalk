@@ -175,47 +175,77 @@
             android:paddingBottom="10dp" />
     </ScrollView>
 
-    <!-- 输入栏 -->
+    <!--
+      录音提示条。只在「按住说话」按下的那几秒里露出来。
+
+      ⚠ 刻意**不做成浮层**（网页端是浮层）：手机上手指正压在按钮上，
+        浮层如果盖在按钮附近会被手掌挡掉一半。放在输入栏正上方这一行，
+        位置固定、不会被指头压住，而且它出现时只是把消息流顶高 26dp，
+        不遮挡任何正在看的内容。
+    -->
+    <TextView
+        android:id="@+id/recHud"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/surface"
+        android:gravity="center"
+        android:paddingTop="5dp"
+        android:paddingBottom="5dp"
+        android:textColor="@color/text"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
+    <!--
+      输入栏。从左到右一排，和网页端的顺序**逐字对齐**：
+
+          语音/键盘 · 附件 ·（输入框 | 按住说话）· 语音通话 · 视频通话 · 发送
+
+      为什么不把「发文件」「按住说话」塞进二级菜单：这两个动作的发生频率和打字
+      是一个量级的（微信就是这么放的），藏进「+」里等于每次多一次点击。
+      代价是一排有 6 颗 40dp 的键，窄屏上输入框只剩 ~140dp —— 但这和网页端
+      是同一个取舍，两端长得一样，用户不必重新学。
+    -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingStart="6dp"
+        android:paddingStart="2dp"
         android:paddingTop="6dp"
-        android:paddingEnd="8dp"
+        android:paddingEnd="4dp"
         android:paddingBottom="6dp">
 
+        <!-- 语音 / 键盘 模式切换。图标随模式换（语音态显示键盘、文字态显示麦克风）。 -->
         <ImageView
-            android:id="@+id/btnAudioCall"
-            android:layout_width="44dp"
+            android:id="@+id/btnVoice"
+            android:layout_width="40dp"
             android:layout_height="44dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
-            android:contentDescription="@string/call_audio"
+            android:contentDescription="@string/to_voice"
             android:focusable="true"
-            android:padding="10dp"
-            android:src="@drawable/ic_call"
-            android:tint="@color/primary" />
+            android:padding="9dp"
+            android:src="@drawable/ic_mic"
+            android:tint="@color/muted" />
 
         <ImageView
-            android:id="@+id/btnVideoCall"
-            android:layout_width="44dp"
+            android:id="@+id/btnAttach"
+            android:layout_width="40dp"
             android:layout_height="44dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
-            android:contentDescription="@string/call_video"
+            android:contentDescription="@string/attach"
             android:focusable="true"
-            android:padding="10dp"
-            android:src="@drawable/ic_videocam"
-            android:tint="@color/primary" />
+            android:padding="9dp"
+            android:src="@drawable/ic_attach"
+            android:tint="@color/muted" />
 
         <EditText
             android:id="@+id/msgInput"
             android:layout_width="0dp"
             android:layout_height="44dp"
-            android:layout_marginStart="4dp"
-            android:layout_marginEnd="4dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
             android:layout_weight="1"
             android:background="@drawable/bg_input"
             android:hint="@string/msg_hint"
@@ -223,21 +253,63 @@
             android:importantForAutofill="no"
             android:inputType="textCapSentences|textMultiLine"
             android:maxLines="4"
-            android:paddingStart="14dp"
-            android:paddingEnd="14dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
             android:textColor="@color/text"
             android:textColorHint="@color/muted"
             android:textSize="15sp" />
 
+        <!-- 「按住 说话」。语音模式下顶掉输入框的位置（同一个 layout_weight=1），
+             这样切换时整排按钮一个都不挪 —— 拇指的位置记忆还是对的。 -->
+        <TextView
+            android:id="@+id/holdTalk"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_hold_talk"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="@string/hold_to_talk"
+            android:textColor="@color/text"
+            android:textSize="15sp"
+            android:visibility="gone" />
+
+        <ImageView
+            android:id="@+id/btnAudioCall"
+            android:layout_width="40dp"
+            android:layout_height="44dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:clickable="true"
+            android:contentDescription="@string/call_audio"
+            android:focusable="true"
+            android:padding="9dp"
+            android:src="@drawable/ic_call"
+            android:tint="@color/primary" />
+
+        <ImageView
+            android:id="@+id/btnVideoCall"
+            android:layout_width="40dp"
+            android:layout_height="44dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:clickable="true"
+            android:contentDescription="@string/call_video"
+            android:focusable="true"
+            android:padding="9dp"
+            android:src="@drawable/ic_videocam"
+            android:tint="@color/primary" />
+
         <ImageView
             android:id="@+id/btnSend"
-            android:layout_width="44dp"
+            android:layout_width="40dp"
             android:layout_height="44dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
             android:contentDescription="@string/send"
             android:focusable="true"
-            android:padding="10dp"
+            android:padding="9dp"
             android:src="@drawable/ic_send"
             android:tint="@color/primary" />
     </LinearLayout>

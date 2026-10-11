@@ -15,6 +15,7 @@
 | 消息会被存吗 | **不会**。Durable Object 全程不调用 storage，没有任何落库动作 |
 | 通话内容服务器看得到吗 | **看不到**。文字走 WebRTC DataChannel、音视频走 SRTP，都是两端浏览器之间的加密直连 |
 | 服务器到底做了什么 | 只当"介绍人"：把双方的 SDP / ICE 候选互相递一次，递完就没事了 |
+| 房间被腾空后还留东西吗 | **不留**。最后一个连接一断开，服务端就把这间房整条删掉（`_leave` 里 `rooms.delete`）；客户端这边也在离房那一刻把本房间的**消息气泡、语音/文件（连同它们的 `blob:` URL）和「记住的设备 / 拉黑名单」一并抹掉**，进房时还会自查一次「这间房是不是空的」。所以同一串口令下一次开出来的房间是干净的，**不会继承上一拨人的任何内容或判断** |
 
 ```
    用户 A 的浏览器  ←──── 音视频：端到端加密直连（不过服务器）────→  用户 B 的浏览器
@@ -43,6 +44,16 @@
    > 这是最糟的信任模型 —— TOFU 也得分用户点头的那一步。
 
    点过之后，同一台设备再进来显示「已确认为熟悉的设备」；换了一台则显示警告。
+
+   > ⚠ 这份记忆**只活在这一间房的这一次使用期间**，一离房就清掉（"腾空即清空"，
+   > 见第一节）。代价是「记住这台设备」的**跨会话保护没有了** —— 下次再进同一个房间
+   > 会被当作第一次见。这是刻意的取舍：口令是共享秘密，而房间号又是口令的派生值，
+   > 同一串口令永远落到同一间房、也就是同一份记忆上；留着它，就等于让**后来拿同一
+   > 口令开房的人**继承上一拨人的判断 —— 最坏的情况是一台毫不相干的设备撞上旧黑名单，
+   > 被自动请出去，而它完全不知道自己踩了什么。
+   > 顺带说明：这份记忆是纯本机的（只在本地跟对方的设备名片做比对，任何一帧协议都
+   > 不带它），所以"泄露给新人"这条风险本来就只存在于**通信内容**上 —— 内容那条已经在
+   > 离房时清干净了（见第一节）。
 4. **一键请出（仅房主）+ 可开关的自动请出**。口令是共享秘密，谁拿到都能进；房间上限是 2，
    一旦被陌生人占了位子，真正的对端就进不来。所以「请出房间」这道口子必须留着 ——
    但权限**只给房主**。后进来的一方看不到这个按钮，也没有这个权限
@@ -106,16 +117,21 @@ roomtalk/
 │   │   ├── MainActivity.kt    三屏一浮层（口令闸门 / 房间 / 全屏通话）
 │   │   ├── core/RoomId.kt     口令 → 房间号（与网页端逐位对齐）
 │   │   ├── core/Wire.kt       信令报文编解码
-│   │   ├── core/Trust.kt      设备 ID + 信任记忆 + 本地拉黑（TOFU）
+│   │   ├── core/Trust.kt      设备 ID + 信任记忆 + 本地拉黑（TOFU，**离房即清**）
+│   │   ├── core/FileUtil.kt   文件名消毒 / 重名避让 / 体积与时长格式化（收发两侧共用）
 │   │   ├── net/Signaling.kt   WebSocket（OkHttp）
-│   │   ├── net/RoomSession.kt 会话状态机（房主 / 信任 / 请出 / 通话生命周期）
+│   │   ├── net/RoomSession.kt 会话状态机（房主 / 信任 / 请出 / 通话 / 语音与文件传输）
 │   │   └── rtc/PeerEngine.kt  PeerConnection / 音频路由 / 两块画布
 │   ├── tools/gen-icons.mjs    从 SVG 出各密度 launcher 图标（走 CDP）
+│   ├── tools/btn-probe.mjs    按像素验通话按钮的「底色 + 白图标」四态（走 CDP）
 │   └── keystore/              ⚠ 签名密钥，**已被 .gitignore 排除，永不入库**
 ├── tools/
 │   └── gen-web-icons.mjs      从 SVG 出网站 PNG 图标（走 CDP）
 └── test/
     ├── e2e.mjs                端到端测试：两个真浏览器 + CDP
+    ├── xfer-e2e.mjs           真机 × 真浏览器：语音 / 文件传输 + 离房清记忆
+    ├── room-probe.mjs         裸 WebSocket 探「这间房里有几个人」（不用浏览器）
+    ├── ghost-probe.mjs        量「僵尸连接会占位多久」
     └── diag-reconnect.mjs     重连诊断脚本
 ```
 
@@ -792,9 +808,10 @@ __rt.__dropSocket()       // 模拟"连接已死"，验证重连
 每次动完前端或 DO，按这个顺序过一遍 —— 全是**能跑出结果**的，不是"看着没问题"。
 
 ```bash
-# 1. 语法（四个文件）
+# 1. 语法（五个文件）
 node --check public/app.js && node --check cloudflare/src/room.js \
-  && node --check cloudflare/src/index.js && node --check test/e2e.mjs
+  && node --check cloudflare/src/index.js && node --check test/e2e.mjs \
+  && node --check test/xfer-e2e.mjs
 
 # 2. 离线逻辑（都不需要 wrangler，秒级出结果）
 node cloudflare/test/do-sim.js        # 72 项，失败必须是 0
@@ -804,10 +821,10 @@ node cloudflare/test/redirect.js      # 19 项，失败必须是 0（http→http
 cd cloudflare
 node node_modules/wrangler/bin/wrangler.js dev --port 8787   # 让它在一个终端里开着
 cd ..
-node test/e2e.mjs                     # 169 项，失败必须是 0
+node test/e2e.mjs                     # 181 项，失败必须是 0
 ```
 
-**4. 改了安卓端的话，还要出包**（细节见第十二节）：
+**4. 改了安卓端的话，还要出包 + 真机跑一遍**（细节见第十二节）：
 
 ```bash
 cd android
@@ -816,15 +833,26 @@ cp app/build/outputs/apk/release/app-release.apk ../public/roomtalk.apk
 # 体积必须 < 25 MiB —— 超了 Cloudflare Assets 会**拒绝整次部署**，不是只丢这个文件
 ls -l ../public/roomtalk.apk
 # 签名必须有效（v2 通过 + 指纹是本项目的）
-"$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/35.0.0/apksigner.bat" verify --print-certs app/build/outputs/apk/release/app-release.apk
+# 装机（指纹一致才能覆盖安装，数据会保留）
+"$ANDROID_HOME/platform-tools/adb" install -r app/build/outputs/apk/release/app-release.apk
+
+# 改了安卓的信任/传输/通话，就必须在真机上过一遍（打的是线上站点，口令每跑一次随机）
+cd .. && node test/xfer-e2e.mjs       # 五步全 ✅
 ```
+
+> ⚠ 改版本号时**顺手核对首页那句文案**（`public/index.html` 里的 `v1.0.7`）：
+> 它曾经漏更到差五个版本，用户看到的是 `v1.0.1` 而装到的是 `1.0.6`。
+> `build.gradle.kts` 的 `versionName` 与首页文案必须一致。
 
 e2e 覆盖（除基础链路外，通话部分是新加的）：
 **首次信任需用户点头** → **视频通话全流程**（顶栏无控件 / 发起即全屏 / 输入栏收起 /
 双向轨道 / 通话中关摄像头不结束通话 / 第三人不得干扰）→ **掉线重连不打断通话、
 挂断后两端媒体真释放** → **默认对方铺满 + 点小窗互换 + 全屏几何** →
 **「按住说话」是放大的圆按钮** + **触摸默认动作全拦掉 / 别的指针不许打断录音 /
-被系统收走也照样发出去 / 刚按下就松开不留红按钮** → **通话中直接退出房间也要收干净**。
+被系统收走也照样发出去 / 刚按下就松开不留红按钮** → **通话中直接退出房间也要收干净** →
+**房间腾空即清空**（离房后本机不留这个房间的信任/拉黑记忆，聊天区连同 `blob:` 一起放掉，
+设备身份 `rt.did` 与设备级偏好留着；带着陈旧记忆进一间空房还会被自愈抹掉）。
 
 > 最后那组是为「手机上按不住」专门加的。这个 bug **headless 里根本复现不了**
 > （合成事件不会被浏览器收走），所以换个思路：把防线的每一环单独验一遍

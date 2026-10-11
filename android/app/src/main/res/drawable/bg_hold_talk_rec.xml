@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「按住 说话」的录制态：实心红底 + 白字。
+
+  用和挂断键同一个红（@color/danger），而不是另调一个色号 —— 这一屏上「红」
+  已经有确定的含义（正在做一件会立刻产生影响的事），再来一个相近的红只会让人
+  以为它们是同一类操作。录制中的红还多了个隐含义：松手就发出去。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="10dp" />
+    <solid android:color="@color/danger" />
+</shape>

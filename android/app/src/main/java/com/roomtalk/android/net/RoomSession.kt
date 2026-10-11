@@ -10,6 +10,9 @@ import com.roomtalk.android.core.RoomId
 import com.roomtalk.android.core.SIGNAL_URL
 import com.roomtalk.android.core.Trust
 import com.roomtalk.android.core.Wire
+import com.roomtalk.android.core.fmtBytes
+import com.roomtalk.android.core.safeFileName
+import com.roomtalk.android.core.uniqueFileIn
 import com.roomtalk.android.rtc.PeerEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,7 +24,13 @@ import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.PeerConnection
 import org.webrtc.SurfaceViewRenderer
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.OutputStream
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * 会话总控：把「信令 + WebRTC + 通话状态机」串起来。
@@ -47,6 +56,21 @@ class RoomSession(private val context: Context) {
     interface Cb {
         fun status(text: String)
         fun message(text: String, mine: Boolean)
+
+        /**
+         * 一条语音消息。
+         * @param path 本地那份音频（自己发的是录音文件，对方发的是落盘到缓存目录的）。点一下播放。
+         * @param dur  录制时长（毫秒），用来画气泡上的「0:07」
+         */
+        fun voice(path: String, dur: Long, mine: Boolean)
+
+        /**
+         * 一条文件消息。
+         * @param path 本地那份文件。点一下可以打开 / 另存为 —— 和网页端「点一下另存」对齐。
+         * @param name 原始文件名（显示用）
+         */
+        fun file(path: String, name: String, size: Long, mine: Boolean)
+
         fun peerInfo(text: String)
         /** 通话态变化：null = 不在通话 */
         fun callState(kind: String?)
@@ -121,12 +145,19 @@ class RoomSession(private val context: Context) {
             engine.setStageLocalMain(value)
         }
 
-    private val clientId = UUID.randomUUID().toString()
+    /**
+     * 信令连接身份。**持久化**，不是每次启动随机生成 —— 服务端靠它认领
+     * 「你自己的旧连接」，理由见 [com.roomtalk.android.core.Trust.clientId]。
+     */
+    private val clientId: String = trust.clientId()
     private var started = false
 
     /** 正在后台派生口令 / 建工厂。防止连点两次各起一套（会留下第二台 PeerConnection）。 */
     @Volatile
     private var entering = false
+
+    /** 本次进房是否已经做过「这间房是不是空的」那次自查。见 T_ROOM_JOINED。 */
+    private var hostWipeDone = false
 
     private val name: String =
         (Build.MANUFACTURER?.takeIf { it.isNotBlank() }?.let { m -> "$m ${Build.MODEL}" } ?: Build.MODEL)
@@ -172,11 +203,14 @@ class RoomSession(private val context: Context) {
                     remotePeerId = null
                     isHost = false
                     peerName = ""
+                    // 新的一次进房，重置「已检查过房间是不是干净的」标记（见 T_ROOM_JOINED）
+                    hostWipeDone = false
 
                     engine.initFactory()
                     engine.onLocalSdp = { type, sdp -> sendSignalDescription(type, sdp) }
                     engine.onLocalIce = { c -> sendSignalCandidate(c) }
                     engine.onDcMessage = { text -> onDcMessage(text) }
+                    engine.onDcBinary = { bytes -> onDcBinary(bytes) }
                     engine.onDcOpen = { onChannelReady() }
                     engine.onRemoteTrack = { onRemoteTrack() }
                     engine.onConnectionChange = { st -> onConnState(st) }
@@ -213,6 +247,8 @@ class RoomSession(private val context: Context) {
         if (callKind != null || callRinging) endCall(silent = false)
         if (remotePeerId != null) signaling?.send(Wire.leave(room))
         teardown()
+        // 房间的记忆不跟着我走：同一口令的房间用完了就该是干净的（见 [Trust.wipeRoom]）
+        trust.wipeRoom(room)
         cb?.backToGate(null)
     }
 
@@ -226,11 +262,30 @@ class RoomSession(private val context: Context) {
     val inRoom: Boolean get() = started
     val inCallNow: Boolean get() = callKind != null
 
+    /* ------------------------- 麦克风 / 摄像头开关 -------------------------
+     *
+     * ⚠ 这两个开关是**自己记账**的，不去读 `engine.hasMicEnabled()` 反推。
+     *
+     * 为什么：那个 getter 读的是 native 侧轨道的 enabled 位。轨道还没建出来
+     * （进了房但没通话）、或者建失败时，它恒为 false —— 于是 `!false` 每次都被
+     * 算成「开」，按钮点上去永远不变色：用户以为自己静音了，其实麦克风还开着。
+     * 真机上表现为「点麦克风没反应、点扬声器却正常」，就是这么来的。
+     *
+     * 自己记账还顺手保证了另一件事：**对端收到的媒体状态和本地按钮永远一致**，
+     * 不会出现一边显示红、一边显示绿的错位。
+     */
+
+    /** 麦克风意图状态。界面画按钮、广播给对端，用的都是它。 */
+    private var micWanted = true
+
+    /** 摄像头意图状态。 */
+    private var camWanted = false
+
     /** 麦克风当前是否开着（界面画按钮状态用）。 */
-    val micOn: Boolean get() = engine.hasMicEnabled()
+    val micOn: Boolean get() = micWanted
 
     /** 摄像头当前是否开着。 */
-    val camOn: Boolean get() = engine.hasCamEnabled()
+    val camOn: Boolean get() = camWanted
 
     /**
      * 界面层建 SurfaceViewRenderer 时要用（必须与采集/解码共用同一个 EglBase）。
@@ -261,12 +316,15 @@ class RoomSession(private val context: Context) {
 
         // 呼叫期间只采集、不发送 —— 见类注释②
         if (!engine.ensureMic(publish = false)) { cb?.toast("无法使用麦克风，请检查权限"); return }
+        micWanted = true
         if (kind == "video" && !engine.ensureCam(publish = false)) {
             engine.setMicEnabled(false)
+            micWanted = false
             engine.closeAll()
             cb?.toast("无法使用摄像头，请检查设备与权限")
             return
         }
+        camWanted = kind == "video"
 
         callKind = kind
         callRinging = true
@@ -303,9 +361,11 @@ class RoomSession(private val context: Context) {
             cb?.toast("麦克风没打开，已拒绝这通电话")
             return
         }
+        micWanted = true
         if (kind == "video" && !engine.ensureCam(publish = true)) {
             cb?.toast("摄像头没打开，已按语音接通")
         }
+        camWanted = kind == "video" && engine.hasCam
         callKind = if (kind == "video" && engine.hasCam) "video" else "audio"
         callRinging = false
         localMain = false
@@ -350,6 +410,9 @@ class RoomSession(private val context: Context) {
         localMain = false
         engine.closeAll()
         engine.setMicEnabled(false)
+        // 下一通电话从「麦克风开、摄像头关」这个默认档重新开始
+        micWanted = true
+        camWanted = false
         cb?.callState(null)
         cb?.ringDismissed()
         cb?.status(if (remotePeerId != null) "已连接" else "等待对方接入")
@@ -358,19 +421,21 @@ class RoomSession(private val context: Context) {
     }
 
     fun toggleMic(): Boolean {
-        if (callKind == null) { cb?.toast("先发起或接听一个通话"); return false }
-        val on = !engine.hasMicEnabled()
-        engine.setMicEnabled(on)
+        if (callKind == null) { cb?.toast("先发起或接听一个通话"); return micWanted }
+        micWanted = !micWanted
+        engine.setMicEnabled(micWanted)
+        Log.i(TAG, "麦克风 → ${if (micWanted) "开" else "关（静音）"}")
         pushMediaState()
-        return on
+        return micWanted
     }
 
     fun toggleCam(): Boolean {
-        if (callKind != "video") { cb?.toast("当前不是视频通话"); return false }
-        val on = !engine.hasCamEnabled()
-        engine.setCamEnabled(on)
+        if (callKind != "video") { cb?.toast("当前不是视频通话"); return camWanted }
+        camWanted = !camWanted
+        engine.setCamEnabled(camWanted)
+        Log.i(TAG, "摄像头 → ${if (camWanted) "开" else "关"}")
         pushMediaState()
-        return on
+        return camWanted
     }
 
     fun flipCamera() {
@@ -449,6 +514,18 @@ class RoomSession(private val context: Context) {
 
             Wire.T_ROOM_JOINED -> {
                 isHost = m.optBoolean("host", false)
+                // host=true 意味着这间房是**我这次进来才建起来的** —— 也就是我进来之前
+                // 它是空的，说明上一拨人早就散了。按「房间腾空即清空」的规矩，这间房
+                // 在本机不该还留着记忆，顺手抹掉。
+                //
+                // 为什么非要有这道自愈：靠「离开房间」触发的那次清理，在**关掉标签页 /
+                // 杀掉应用 / 崩溃 / 断网变僵尸**这些最常见的离场方式下根本不会执行 ——
+                // 那些记忆会一直留着，直到某天一台毫不相干的设备撞上旧黑名单被自动
+                // 请出去。只在每次进房的第一条 room-joined 上做，避免重连时误清。
+                if (isHost && !hostWipeDone) {
+                    hostWipeDone = true
+                    trust.wipeRoom(room)
+                }
                 cb?.host(isHost)
                 cb?.status("等待对方接入")
             }
@@ -493,6 +570,8 @@ class RoomSession(private val context: Context) {
 
             Wire.T_KICKED -> {
                 teardown()
+                // 被请出去 = 这一次会面到此为止，房间的记忆一并不留（见 [Trust.wipeRoom]）
+                trust.wipeRoom(room)
                 cb?.backToGate("对方把你请出了这个房间")
             }
 
@@ -575,6 +654,7 @@ class RoomSession(private val context: Context) {
 
     private fun finishPeerGone(toast: String = "对方已离开") {
         peerLeftTimer = null
+        dropRx()
         cancelCallOutTimer()
         engine.disposePeer()
         engine.closeAll()
@@ -635,6 +715,8 @@ class RoomSession(private val context: Context) {
 
             Dc.T_ID -> onPeerIdentity(m.optString("id"))
 
+            Dc.T_XFER -> onXferCtl(m)
+
             Dc.T_BYE -> when {
                 // 已经在通话 / 我们正在呼叫 → 正常收摊
                 callKind != null || callRinging -> endCall(silent = true)
@@ -683,11 +765,282 @@ class RoomSession(private val context: Context) {
     fun pushMediaState() {
         if (callRinging) return
         if (!engine.isChannelOpen) return
-        engine.sendDc(Dc.media(engine.hasMicEnabled(), engine.hasCamEnabled(), "smooth"))
+        engine.sendDc(Dc.media(micWanted, camWanted, "smooth"))
     }
 
     private var remoteAudio = false
     private var remoteVideo = false
+
+    /* ======================= 文件 / 语音传输（与网页端同协议） =======================
+     *
+     * 三段式：begin（控制消息） → 若干裸二进制分片 → end（控制消息）。
+     * 与网页端 `sendXfer` / `onXferCtl` 是同一套线协议，两端可以互发。
+     *
+     * 三个设计取舍，都是踩过或推演过才定下的：
+     *
+     * ① **分片直接写盘，不在内存里攒。** 网页端把分片攒进数组再拼 Blob，是因为
+     *    浏览器里没有「随收随写」这种 API；安卓这边没必要跟着学 —— 100MB 的
+     *    分片列表在手机上足够触发 OOM，而边收边写盘的峰值内存只有一个分片。
+     *
+     * ② **接收在主线程做（含 64KB 的 write）。** 看着有点重，但它换来的是
+     *    「文本和二进制走同一条队列」，顺序天然正确（详见 PeerEngine.onDcBinary 的
+     *    说明）。单次 write 是几十微秒级的，100MB 摊到 1600 次也感知不到；
+     *    反过来如果为了这点开销另起一条线程，就要额外处理 begin 与分片的竞态。
+     *
+     * ③ **发送在后台线程，但每一次 `send` 都甩回主线程执行。** 读取文件（可能几十 MB）
+     *    不能压在主线程上；而 `DataChannel.send` 与旧代码的约定是「只在主线程调」。
+     *    两者兼顾的办法就是 [sendOnMain]：后台线程算好分片，主线程负责发。
+     */
+
+    /** 正在收的那一笔。null = 当前没有传输。 */
+    private var rx: Rx? = null
+
+    private class Rx(
+        val id: String,
+        val kind: String,
+        /** 显示名（原文件名；语音没有名字） */
+        val name: String,
+        val size: Long,
+        val dur: Long,
+        val file: File,
+        val out: OutputStream,
+    ) {
+        var got: Long = 0
+
+        fun close() {
+            try { out.close() } catch (_: Throwable) { /* 已经关了 */ }
+        }
+    }
+
+    /** 收到传输控制消息。 */
+    private fun onXferCtl(m: JSONObject) {
+        when (m.optString("phase")) {
+            Dc.PHASE_BEGIN -> beginRx(m)
+            Dc.PHASE_END -> finishRx()
+            Dc.PHASE_ABORT -> {
+                rx?.close()
+                rx = null
+                cb?.toast("对方取消了这次传输")
+            }
+        }
+    }
+
+    private fun beginRx(m: JSONObject) {
+        // 上一笔还没收完又来了新的 → 旧的作废（正常不会发生，但不能让它占着句柄）
+        rx?.close()
+        rx = null
+
+        val id = m.optString("id")
+        val size = m.optLong("size", -1L)
+        if (id.isBlank() || size < 0) return
+        if (size > XFER_MAX_BYTES) {
+            cb?.toast("对方要发的东西太大了（${fmtBytes(size)}），超过 100MB 上限")
+            // ⚠ 要回一条 abort：不回的话对方会一直等在那里把字节灌进虚空
+            engine.sendDc(Dc.xferAbort(id))
+            return
+        }
+
+        val kind = m.optString("kind").ifBlank { Dc.KIND_FILE }
+        val mime = m.optString("mime")
+        val rawName = m.optString("name")
+        val dir = File(context.cacheDir, RECV_DIR).apply { mkdirs() }
+
+        val shownName: String
+        val target: File
+        if (kind == Dc.KIND_VOICE) {
+            shownName = ""
+            target = uniqueFileIn(dir, "voice-${System.currentTimeMillis()}.${extFor(mime)}")
+        } else {
+            shownName = rawName.ifBlank { "文件" }
+            // ⚠ 对端给的名字是不可信输入，必须先洗掉路径分隔符再落盘，
+            //   否则 `../../xxx` 这种能写到缓存目录外面去。
+            target = uniqueFileIn(dir, safeFileName(shownName))
+        }
+
+        val out = try {
+            FileOutputStream(target)
+        } catch (t: Throwable) {
+            Log.w(TAG, "无法落盘接收的文件", t)
+            cb?.toast("接收失败：写不进缓存目录")
+            engine.sendDc(Dc.xferAbort(id))
+            return
+        }
+        rx = Rx(id, kind, shownName, size, m.optLong("dur", 0L), target, out)
+
+        if (kind == Dc.KIND_FILE && size > PROGRESS_MIN_BYTES) {
+            cb?.status("正在接收 $shownName…")
+        }
+    }
+
+    /** 收到一个二进制分片。与文本同队列，所以这边的 rx 一定已经建好了。 */
+    private fun onDcBinary(bytes: ByteArray) {
+        val r = rx ?: return              // 没有 begin（或已取消）→ 丢掉，别当成正文
+        try {
+            r.out.write(bytes)
+            r.got += bytes.size
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入分片失败", t)
+            r.close()
+            rx = null
+            cb?.toast("接收中写出错，这条没收下来")
+        }
+    }
+
+    private fun finishRx() {
+        val r = rx ?: return
+        rx = null
+        r.close()
+        Log.i(TAG, "收到 ${r.kind} ${r.name} 共 ${r.got}/${r.size} 字节 → ${r.file.name}")
+
+        if (r.got < r.size) {
+            // 少了字节就绝不当成完整文件交给用户 —— 半截的 apk / 图片比没有更误导
+            r.file.delete()
+            cb?.toast("传输不完整（收到 ${fmtBytes(r.got)} / ${fmtBytes(r.size)}）")
+            cb?.status(if (remotePeerId != null) "已连接" else "等待对方接入")
+            return
+        }
+        cb?.status(if (remotePeerId != null) "已连接" else "等待对方接入")
+        if (r.kind == Dc.KIND_VOICE) cb?.voice(r.file.absolutePath, r.dur, false)
+        else cb?.file(r.file.absolutePath, r.name, r.got, false)
+    }
+
+    /**
+     * 发一条语音 / 一个文件。
+     *
+     * @param localPath 本地那份（自己这条气泡点开时用的就是它）
+     * @param onDone    成功与否。**只在主线程回调** —— 界面要拿它给气泡打「失败」标。
+     */
+    fun sendTransfer(
+        kind: String,
+        name: String,
+        mime: String,
+        size: Long,
+        dur: Long,
+        localPath: String,
+        onDone: ((Boolean) -> Unit)? = null,
+    ) {
+        if (!dcReady()) {
+            cb?.toast("还没和对方接通")
+            onDone?.invoke(false)
+            return
+        }
+        if (size > XFER_MAX_BYTES) {
+            cb?.toast("「$name」超过 100MB 上限，换个小点的")
+            onDone?.invoke(false)
+            return
+        }
+        if (size <= 0) {
+            onDone?.invoke(false)
+            return
+        }
+
+        val id = UUID.randomUUID().toString()
+        val src = File(localPath)
+        Thread({
+            var ok = false
+            try {
+                ok = pumpOut(id, kind, name, mime, size, dur, src)
+            } catch (t: Throwable) {
+                Log.w(TAG, "发送失败", t)
+            } finally {
+                main.post { onDone?.invoke(ok) }
+            }
+        }, "rt-send").start()
+    }
+
+    /** 真正的发送循环（后台线程）。返回是否完整送达通道。 */
+    private fun pumpOut(
+        id: String,
+        kind: String,
+        name: String,
+        mime: String,
+        size: Long,
+        dur: Long,
+        src: File,
+    ): Boolean {
+        if (!sendOnMain { engine.sendDc(Dc.xferBegin(id, kind, name, mime, size, dur)) }) return false
+
+        val big = size > PROGRESS_MIN_BYTES
+        if (big) main.post { cb?.status("正在发送 $name…") }
+
+        val buf = ByteArray(XFER_CHUNK)
+        var sent = 0L
+        var lastPct = -1
+
+        try {
+            FileInputStream(src).use { ins ->
+                while (sent < size) {
+                    if (!engine.isChannelOpen) return false
+
+                    // 背压：缓冲顶到高水位就等它排下去。
+                    // ⚠ 必须带超时兜底 —— 万一通道一直不通，没有上限的等待会让这条
+                    //   线程永远挂着（用户看到的就是「一直卡在 42%」）。
+                    var waited = 0
+                    while (engine.dcBufferedAmount() > XFER_HIGH && waited < DRAIN_TIMEOUT_MS) {
+                        Thread.sleep(20)
+                        waited += 20
+                    }
+                    if (waited >= DRAIN_TIMEOUT_MS) return false
+
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    // copyOf 是必须的：buf 会被下一轮复用，而主线程是**异步**取的，
+                    // 直接传 buf 会让某一分片发到别人的内容。
+                    val chunk = buf.copyOf(n)
+                    if (!sendOnMain { engine.sendDcBinary(chunk) }) return false
+                    sent += n
+
+                    if (big) {
+                        val pct = ((sent * 100) / size).toInt()
+                        if (pct != lastPct) {
+                            lastPct = pct
+                            main.post { cb?.status("正在发送 $name $pct%") }
+                        }
+                    }
+                }
+            }
+            if (sent < size) return false
+            if (!sendOnMain { engine.sendDc(Dc.xferEnd(id)) }) return false
+        } finally {
+            main.post { cb?.status(if (remotePeerId != null) "已连接" else "等待对方接入") }
+        }
+        return true
+    }
+
+    /**
+     * 在主线程上跑一段「发数据」的代码，并等它真的跑完。
+     *
+     * 为什么非等不可：不等就没有背压 —— 后台线程会一路把整个文件全塞进
+     * `main` 的消息队列（几十 MB 的分片对象全排在那儿），缓冲水位根本来不及反映，
+     * 也就无从判断「该停下来等一等」。
+     */
+    private fun sendOnMain(block: () -> Boolean): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        val latch = CountDownLatch(1)
+        var ok = false
+        main.post {
+            try { ok = block() } finally { latch.countDown() }
+        }
+        return if (latch.await(5, TimeUnit.SECONDS)) ok else false
+    }
+
+    /**
+     * 语音存成什么扩展名，由 mime 决定 —— 拿错了系统播放器就打不开。
+     *
+     * 安卓这边**只**产 mp4/aac，但对面可能是网页端（Chrome 给 webm/opus、
+     * Safari 给 mp4），所以四种都要认。落盘扩展名和内容对不上时，
+     * MediaPlayer 会直接报错，用户看到的是「点了没反应」。
+     */
+    private fun extFor(mime: String): String {
+        val m = mime.lowercase()
+        return when {
+            m.contains("mp4") || m.contains("m4a") || m.contains("aac") -> "m4a"
+            m.contains("webm") -> "webm"
+            m.contains("ogg") -> "ogg"
+            m.contains("mpeg") -> "mp3"
+            else -> "bin"
+        }
+    }
 
     /* ============================== 信任（TOFU） ============================== */
 
@@ -808,8 +1161,23 @@ class RoomSession(private val context: Context) {
         peerLeftTimer = null
     }
 
+    /**
+     * 把「正在收的那一笔」作废：关句柄 + 删掉半截文件。
+     *
+     * 为什么必须删：对方断线时那笔传输不会有 end，留在缓存目录里的半截文件
+     * 既占地方又永远不会有人来收尾 —— 一个几百 MB 的残片能一直躺在那里，
+     * 直到系统自己清缓存为止。
+     */
+    private fun dropRx() {
+        val r = rx ?: return
+        rx = null
+        r.close()
+        try { r.file.delete() } catch (_: Throwable) { /* 删不掉就算了，别因此中断收摊 */ }
+    }
+
     private fun teardown() {
         started = false
+        dropRx()
         // 后台那趟「派生 + 建厂」还没回来时用户就退出了 —— 标记作废，
         // 免得它回来之后又把信号连接建起来（用户已经不在房间页了）
         entering = false
@@ -828,12 +1196,35 @@ class RoomSession(private val context: Context) {
         signaling = null
     }
 
-    private companion object {
-        const val TAG = "RoomTalk.Session"
+    companion object {
+        private const val TAG = "RoomTalk.Session"
 
         /** 本地开发环境几十毫秒就能重连，1.5 秒在线上必然误杀 —— 见类注释③ */
-        const val GRACE_IN_CALL_MS = 20_000L
-        const val GRACE_CHAT_MS = 1_500L
+        private const val GRACE_IN_CALL_MS = 20_000L
+        private const val GRACE_CHAT_MS = 1_500L
+
+        /* ---------- 传输参数：前三个与网页端逐字一致，改一处必须两端同改 ---------- */
+
+        /** 每个分片的字节数（对齐网页端 XFER_CHUNK） */
+        const val XFER_CHUNK = 64 * 1024
+
+        /** 单文件上限（对齐网页端 XFER_MAX）。再大手机上内存和时长都吃不消。 */
+        const val XFER_MAX_BYTES = 100L * 1024 * 1024
+
+        /** 单条语音最长 60 秒（和微信一个量级），「按住说话」到点会自动停 */
+        const val VOICE_MAX_MS = 60_000L
+
+        /** 通道缓冲高于它就暂停发送（对齐网页端 XFER_HIGH） */
+        private const val XFER_HIGH = 1_000_000L
+
+        /** 超过这个体量才值得显示进度 —— 几 KB 的东西闪一下反而像卡了 */
+        private const val PROGRESS_MIN_BYTES = 256 * 1024L
+
+        /** 背压等待的上限。到点还不通就直接判失败，别把发送线程永久挂住。 */
+        private const val DRAIN_TIMEOUT_MS = 30_000
+
+        /** 收到的文件落在 cacheDir 的哪个子目录 */
+        private const val RECV_DIR = "recv"
 
         val DEFAULT_ICE = listOf(
             "stun:stun.cloudflare.com:3478",

@@ -118,6 +118,53 @@ object Dc {
     const val T_RING = "ring"
     const val T_RING_ANSWER = "ring-answer"
     const val T_BYE = "bye"
+    const val T_XFER = "xfer"
+
+    /* ---------------- 文件 / 语音传输（三段式） ----------------
+     *
+     * 与网页端 `sendXfer` 逐字对齐：
+     *
+     *     {t:'xfer', phase:'begin', ...元信息}  →  若干裸二进制分片  →  {phase:'end'}
+     *
+     * chat 通道是 ordered:true，二进制**必然**落在 begin 和 end 之间，所以接收端
+     * 只需要一个「当前正在收的那一笔」状态机，不必带序号。
+     *
+     * ⚠ 三个字段的语义要和网页端一致，否则两端会各说各话：
+     *   · kind —— "file" 落成文件气泡、"voice" 落成语音气泡（时长在 dur）
+     *   · mime —— 语音必须靠它决定存成 .m4a 还是 .webm
+     *   · size —— 接收端拿它决定要不要拒绝、以及算进度
+     */
+
+    const val PHASE_BEGIN = "begin"
+    const val PHASE_END = "end"
+    const val PHASE_ABORT = "abort"
+
+    const val KIND_FILE = "file"
+    const val KIND_VOICE = "voice"
+
+    fun xferBegin(
+        id: String,
+        kind: String,
+        name: String,
+        mime: String,
+        size: Long,
+        dur: Long,
+    ) = JSONObject()
+        .put("t", T_XFER)
+        .put("phase", PHASE_BEGIN)
+        .put("id", id)
+        .put("kind", kind)
+        .put("name", name.take(180))
+        .put("mime", mime)
+        .put("size", size)
+        .put("dur", dur)
+        .toString()
+
+    fun xferEnd(id: String) =
+        JSONObject().put("t", T_XFER).put("phase", PHASE_END).put("id", id).toString()
+
+    fun xferAbort(id: String) =
+        JSONObject().put("t", T_XFER).put("phase", PHASE_ABORT).put("id", id).toString()
 
     fun msg(text: String) = JSONObject().put("t", T_MSG).put("text", text).toString()
 

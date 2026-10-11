@@ -47,5 +47,23 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          收到的文件要能「用其他应用打开」，必须借 FileProvider 转成 content:// URI。
+
+          ⚠ android:exported 必须是 false：这个 provider 只服务于「我主动递给
+            某个应用的那一个文件」，不是给外部随便查的接口。
+          ⚠ authorities 用 ${applicationId} 拼，不写死包名 —— 写死之后一旦改包名
+            （debug 变体、渠道包）会静默失效，报错还是运行时才出。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

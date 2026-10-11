@@ -46,22 +46,51 @@
             android:textColor="@color/muted"
             android:textSize="14sp" />
 
-        <EditText
-            android:id="@+id/passInput"
+        <!--
+          口令输入。**默认遮蔽**，右侧留一个「显示 / 隐藏」切换 —— 和网页端一致
+          （那边是 type="password" 配一颗「显示」按钮）。
+
+          为什么要遮蔽：两人约定的暗号多半是当着旁边人的面敲进去的。
+          但又不能只遮蔽不给看：输入法打错一个字符，症状会从「进不去」变成
+          「对方一直没进来」—— 光盯着屏幕没法自证，必须留一个能核对的手段。
+        -->
+        <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="52dp"
-            android:layout_marginTop="30dp"
-            android:background="@drawable/bg_input"
-            android:hint="@string/pass_hint"
-            android:imeOptions="actionGo"
-            android:importantForAutofill="no"
-            android:inputType="text"
-            android:maxLines="1"
-            android:paddingStart="16dp"
-            android:paddingEnd="16dp"
-            android:textColor="@color/text"
-            android:textColorHint="@color/muted"
-            android:textSize="16sp" />
+            android:layout_marginTop="30dp">
+
+            <EditText
+                android:id="@+id/passInput"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@drawable/bg_input"
+                android:hint="@string/pass_hint"
+                android:imeOptions="actionGo"
+                android:importantForAutofill="no"
+                android:inputType="textPassword"
+                android:maxLines="1"
+                android:paddingStart="16dp"
+                android:paddingEnd="60dp"
+                android:textColor="@color/text"
+                android:textColorHint="@color/muted"
+                android:textSize="16sp" />
+
+            <!-- 必须写在 EditText 之后才盖在上层；paddingEnd 给足，别让口令文字钻到它下面 -->
+            <TextView
+                android:id="@+id/passToggle"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:layout_gravity="end"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="56dp"
+                android:paddingStart="10dp"
+                android:paddingEnd="14dp"
+                android:text="@string/pass_show"
+                android:textColor="@color/muted"
+                android:textSize="13sp" />
+        </FrameLayout>
 
         <TextView
             android:id="@+id/enterBtn"

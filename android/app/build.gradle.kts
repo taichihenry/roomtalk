@@ -33,8 +33,15 @@ android {
         applicationId = "com.roomtalk.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        // 1.0.0 → 1.0.1：R8 误删 org.jni_zero 导致点「进入」就原生崩溃（已修）
+        // 1.0.1 → 1.0.2：在 WebRTC signaling 线程上改 UI 触发 native abort（已修）
+        // 1.0.2 → 1.0.3：clientId 持久化 + mic/cam 账本化（修「按钮点了不变色」）
+        // 1.0.3 → 1.0.4：口令页「显示/隐藏」切换（默认遮蔽）
+        // 1.0.4 → 1.0.5：通话按钮 → 实心圆底（开绿/关红）+ 白图标，与挂断键同款
+        // 1.0.5 → 1.0.6：补齐「按住说话」发语音 + 发文件（对齐网页端的 xfer 协议）
+        // 1.0.6 → 1.0.7：离房即清掉本房间的信任/拉黑记忆（腾空即清空，与网页端对齐）
+        versionCode = 8
+        versionName = "1.0.7"
 
         // WebRTC 的 .so 按架构各带一份，多一个架构就多几十 MB。
         // 只留两种主流 ARM：x86 平板与模拟器不覆盖（那本来也不是用户群）。
