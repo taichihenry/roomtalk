@@ -1,0 +1,36 @@
+<resources>
+    <string name="app_name">口令通话</string>
+
+    <string name="lede">和对方输入同一串口令，即可接通。</string>
+    <string name="pass_hint">输入你们的暗号</string>
+    <string name="enter">进入</string>
+    <string name="gate_hint">口令只在你手机上参与计算，服务器只收到一串随机房间号，不知道你们的暗号是什么。</string>
+
+    <string name="leave">离开</string>
+    <string name="kick">请出房间</string>
+    <string name="trust_keep">记住这台设备</string>
+    <string name="trust_unblock">解除拉黑</string>
+    <string name="autokick">自动请出</string>
+    <string name="waiting">等待对方接入</string>
+    <string name="msg_hint">说点什么…</string>
+    <string name="send">发送</string>
+    <string name="call_audio">语音通话</string>
+    <string name="call_video">视频通话</string>
+
+    <string name="mic">麦克风</string>
+    <string name="cam">摄像头</string>
+    <string name="flip">翻转</string>
+    <string name="speaker">扬声器</string>
+    <string name="hangup">挂断</string>
+    <string name="calling">正在呼叫…</string>
+    <string name="in_call">通话中</string>
+
+    <string name="ring_audio">对方想和你语音通话</string>
+    <string name="ring_video">对方想和你视频通话</string>
+    <string name="ring_sub">接听后才会打开你的麦克风</string>
+    <string name="accept">接听</string>
+    <string name="reject">拒绝</string>
+
+    <string name="perm_need">需要麦克风与摄像头权限才能通话</string>
+    <string name="perm_go">去授权</string>
+</resources>

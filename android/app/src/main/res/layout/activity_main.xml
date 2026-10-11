@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  三个屏都常驻在这一层 FrameLayout 里，靠 visibility 切换 —— 不做 Fragment 事务，
+  因为屏与屏之间没有「各自独立的状态」需要保存，来回切只是显示/隐藏。
+
+  层级（从下到上）：gate → room → call → 来电浮层 → toast
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg">
+
+    <include
+        android:id="@+id/screenGate"
+        layout="@layout/screen_gate"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <include
+        android:id="@+id/screenRoom"
+        layout="@layout/screen_room"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <include
+        android:id="@+id/screenCall"
+        layout="@layout/screen_call"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <include
+        android:id="@+id/ringOverlay"
+        layout="@layout/overlay_ring"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 一条底部气泡提示，自己会消失 -->
+    <TextView
+        android:id="@+id/toastView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="96dp"
+        android:background="@drawable/bg_pill"
+        android:maxWidth="300dp"
+        android:paddingStart="16dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="14sp"
+        android:visibility="gone" />
+</FrameLayout>

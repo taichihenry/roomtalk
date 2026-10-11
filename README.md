@@ -91,12 +91,29 @@ roomtalk/
 │   ├── index.html             首屏就是输入口令，没有任何多余元素
 │   ├── app.js                 整个客户端：派生房间号 / 信令 / P2P / 重连 / 设备记忆
 │   ├── app.css
+│   ├── roomtalk.apk           安卓安装包（唯一需要跟仓库一起发布的二进制，见第十二节）
+│   ├── manifest.webmanifest   PWA 清单（display 刻意是 browser，见第十二节）
+│   ├── icon-192.png / icon-512.png / icon-maskable-512.png
+│   ├── apple-touch-icon.png
 │   └── _headers               安全响应头 + 静态资源缓存策略
 ├── cloudflare/
 │   ├── src/index.js           Worker 入口：域名归一 / /ws / /healthz / 其余交给 Assets
 │   ├── src/room.js            SignalRoom Durable Object：整张房间表 + 信令转发
 │   ├── wrangler.toml          部署配置
 │   └── test/do-sim.js         DO 逻辑离线测试（不需要 wrangler）
+├── android/                 ← 安卓 App（原生 WebRTC，Kotlin，见第十二节）
+│   ├── app/src/main/java/com/roomtalk/android/
+│   │   ├── MainActivity.kt    三屏一浮层（口令闸门 / 房间 / 全屏通话）
+│   │   ├── core/RoomId.kt     口令 → 房间号（与网页端逐位对齐）
+│   │   ├── core/Wire.kt       信令报文编解码
+│   │   ├── core/Trust.kt      设备 ID + 信任记忆 + 本地拉黑（TOFU）
+│   │   ├── net/Signaling.kt   WebSocket（OkHttp）
+│   │   ├── net/RoomSession.kt 会话状态机（房主 / 信任 / 请出 / 通话生命周期）
+│   │   └── rtc/PeerEngine.kt  PeerConnection / 音频路由 / 两块画布
+│   ├── tools/gen-icons.mjs    从 SVG 出各密度 launcher 图标（走 CDP）
+│   └── keystore/              ⚠ 签名密钥，**已被 .gitignore 排除，永不入库**
+├── tools/
+│   └── gen-web-icons.mjs      从 SVG 出网站 PNG 图标（走 CDP）
 └── test/
     ├── e2e.mjs                端到端测试：两个真浏览器 + CDP
     └── diag-reconnect.mjs     重连诊断脚本
@@ -790,6 +807,18 @@ cd ..
 node test/e2e.mjs                     # 169 项，失败必须是 0
 ```
 
+**4. 改了安卓端的话，还要出包**（细节见第十二节）：
+
+```bash
+cd android
+gradle :app:assembleRelease           # 失败必须是 0，BUILD SUCCESSFUL
+cp app/build/outputs/apk/release/app-release.apk ../public/roomtalk.apk
+# 体积必须 < 25 MiB —— 超了 Cloudflare Assets 会**拒绝整次部署**，不是只丢这个文件
+ls -l ../public/roomtalk.apk
+# 签名必须有效（v2 通过 + 指纹是本项目的）
+"$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk
+```
+
 e2e 覆盖（除基础链路外，通话部分是新加的）：
 **首次信任需用户点头** → **视频通话全流程**（顶栏无控件 / 发起即全屏 / 输入栏收起 /
 双向轨道 / 通话中关摄像头不结束通话 / 第三人不得干扰）→ **掉线重连不打断通话、
@@ -831,6 +860,11 @@ e2e 覆盖（除基础链路外，通话部分是新加的）：
 | app.css | ~6 KB（gzip） | 同上 |
 | 外部依赖 | **0**（无框架、无 CDN、无字体外链） | 通读 `index.html` 的 `<link>` / `<script>` |
 | 首屏请求 | 3 个：HTML + CSS，JS 由 preload 并行拉 | 见第九节 |
+| roomtalk.apk | ~11 MB，**硬上限 25 MiB** | `ls -l public/roomtalk.apk` |
+
+> `roomtalk.apk` 是**按需下载**的，不算首屏 —— 它只在你展开首页的「装到手机上」时才请求。
+> 但它是**唯一一个会因为体积把整次部署搞挂**的文件（Assets 单文件上限 25 MiB），
+> 所以改完安卓端必须看一眼。debug 包 23.5 MB 已经贴着上限了，**永远发 release 包**。
 
 ### 稳（会不会越跑越糟）
 
@@ -917,3 +951,121 @@ gh api repos/taichihenry/roomtalk/commits/<sha>/check-runs \
 > 官方 API 也能改：`PATCH /zones/{id}/settings/always_use_https`，但需要带
 > `zone_settings:edit` 的令牌。wrangler 那份 OAuth 凭据权限不够，直连会报
 > `10000 Authentication error` —— 别在这上面浪费时间，去控制台点两下更快。
+
+---
+
+## 十二、安卓 App 与 iOS 入口
+
+### 为什么是「原生重写」，而不是套一个 WebView 壳
+
+市面上有现成的「网页转 App」壳（GitHub 上的 `web-to-app` 那类，6766★）。评估后**没用**，
+原因不是它不好，而是**我们要的东西它给不了**：
+
+| | WebView 壳 | 原生（本项目） |
+|---|---|---|
+| 内核 | 系统 WebView（各家版本不一） | 内置 WebRTC SDK（版本固定） |
+| `getUserMedia` | 依赖系统 WebView 实现，国产 ROM 上常被裁 | 自己管权限与采集，可控 |
+| 音频路由 | 壳一般不管，来电/免提行为随缘 | 显式 `MODE_IN_COMMUNICATION` + 扬声器开关 |
+| 体积 | 壳本身就几十 MB | **11 MB** |
+| 端口 | 无 | 无（信令只走 wss，媒体 P2P） |
+
+「网页转 App」还有个通病：它把网页**整包塞进 assets**，等于每个 App 自带一份站点副本 ——
+改一行 HTML 也要用户重装。我们反过来，App 里**只放协议**，页面怎么改都不影响它。
+
+### 它和网页端是「同一个协议的两个客户端」，不是两套东西
+
+这点必须守住，否则两边会各说各话：
+
+- **口令 → 房间号**：`core/RoomId.kt` 与 `public/app.js` 里的推导**逐位对齐**。
+  改了网页端的算法，安卓端不同步改，两边就进不了同一个房间。有单测
+  （`app/src/test/.../RoomIdTest.kt`）钉住向量。
+- **报文格式**：`core/Wire.kt` 对应网页端那一套 `{t:...}`。
+  `msg` / `media` / `id` / `ring` / `ring-answer` / `bye` / `xfer` 全部同名同义。
+- **设备信任（TOFU）**：网页端靠 `{t:'id'}` 递名片认设备。安卓端**照搬了一整套**
+  （`core/Trust.kt`：设备 ID 持久化 + 信任条 + 本地拉黑 `rt.block.<房间>` + 自动请出）。
+  ⚠ 安卓端**绝不能每次随机生成设备 ID** —— 那会让对端**每次都弹「对方换了一台设备」**，
+  而对方其实什么都没做。设备 ID 必须落盘（`SharedPreferences`）。
+- **拉黑是纯客户端的**：服务端（DO）**只有 `kick`，没有黑名单**。所以「我不再接受这个人」
+  是各端自己的本地名单，换设备/清数据就没了。这是设计如此，不是漏做。
+
+### 出包
+
+```bash
+cd android
+gradle :app:assembleRelease
+cp app/build/outputs/apk/release/app-release.apk ../public/roomtalk.apk
+```
+
+- **密钥**：`keystore/roomtalk.jks`（alias `roomtalk`，RSA 2048，10950 天），
+  口令在 `keystore/keystore.properties`。**两个文件都被 `.gitignore` 排除。**
+  ⚠ 丢了它就**再也无法给已安装的用户出升级包**（新密钥 = 另一个 App，系统拒绝覆盖安装）；
+  泄漏它等于任何人都能冒名发布「口令通话」的更新。请单独备份。
+  SHA-256 指纹：`67:BA:70:6A:67:F8:9F:3E:AB:2F:FE:E8:24:A7:38:F1:08:7E:E4:C7:E0:73:1B:EF:BC:BD:2E:38:3E:54:92:61`
+- **必须是 release 包**：debug 包 23.5 MB，**已经贴着 Cloudflare 的 25 MiB 单文件上限**；
+  release 包开 R8 + 资源收缩 + `jniLibs.useLegacyPackaging = true`（把 `.so` 从
+  Stored 改成 Deflate）之后是 **11 MB**。
+- ⚠ **超了 25 MiB 不是"丢掉这个文件"，是整次部署失败。** 所以出完包先 `ls -l` 看一眼。
+
+### 首页怎么挂
+
+`public/index.html` 页脚有个 `<details class="getapp">`，默认收起 —— **首屏仍然只有「输口令」一件事**，
+想装的人自己展开。里面两条路：
+
+- **安卓**：`<a href="roomtalk.apk" download>`，`_headers` 里把 MIME 写死成
+  `application/vnd.android.package-archive`（Assets 按扩展名猜不出来，猜成
+  `application/octet-stream` 系统就不认）。`Cache-Control: no-store`：文件名不带版本号，
+  缓存了的话用户下次升级还会拿到旧包。
+- **iOS**：只能讲清楚用法 —— 用 **Safari** 打开 → 分享 → 添加到主屏幕。
+
+### ⚠ iOS 那条路有个硬伤，必须跟用户说明
+
+**iOS 的 standalone PWA 拿不到摄像头**（WebKit bug 185448）。也就是说，谁要是加了
+`<meta name="apple-mobile-web-app-capable">`，图标点开就会跑成独立应用，视频通话**直接没画面**，
+而且用户完全不知道为什么。
+
+所以我们**刻意不加**这个 meta，清单里也写 `"display": "browser"`：
+图标照加，点开仍然落在 Safari 里 —— **Safari 里权限是通的**。
+`index.html` 里留了注释把这件事钉住，`README` 里这条就是给下一个人看的。
+
+（安卓侧不受影响：那边走的是真安装包，WebView 的坑一个都不沾。）
+
+### 安卓侧的坑（改代码前先读）
+
+- **SDK API 必须用 `javap` 核对**。文档和网上的示例常常对不上，对着写只会报
+  「overrides nothing」这种看不出所以然的错。做法：解开 AAR 里的 `classes.jar`，
+  直接看真实签名。踩过的两个：
+  - `PeerConnection.Observer.onTrack` 是**单个 `RtpTransceiver`**（default 方法），
+    **不是数组**。
+  - `RtpTransceiver.getReceiver()` 到 Kotlin 里是**合成属性**，写 `receiver()` 编译不过。
+- **ADM 在 `org.webrtc.audio` 子包**，不在 `org.webrtc` 顶层。`grep org/webrtc/*.class`
+  会找不到，然后误判「这个 SDK 没有 ADM」。
+- **ADM 必须在 factory 之后 release**。顺序反了，退出时 native 崩溃。
+- **远端轨道「现问」**，不靠回调缓存：`pc.receivers.firstNotNullOfOrNull { it.track() as? VideoTrack }`。
+  各家 SDK 版本回调时机不一致，缓存很容易拿到 null。
+- **隐私闸门 `remoteRenderAllowed`**：没接通时远端轨道按 `null` 处理，
+  画布上只有自己。对应网页端第六节那条「未接听不得泄露音视频」，
+  ⚠ **不要用 `media.video` 之类的标志位代替** —— 关摄像头和没接通是两回事。
+- **音频路由是全局的**：`AudioManager.mode = MODE_IN_COMMUNICATION` + `isSpeakerphoneOn`。
+  **收摊必须复位**，否则挂断后整机声音还停在「通话」档，用户会以为手机坏了。
+- **两块画布只换轨道、不换布局**：`applyStage()` + `stageLocalMain`（点格子互换）。
+  小窗必须 `setZOrderMediaOverlay(true)` 抬层，否则被大窗盖住 —— 表现为**小窗永远黑**。
+- **渲染器必须共用引擎的 `EglBase`**：`init(eglContext, null)`。各建各的会出现
+  **「有声音、没画面」**这种最费时间的症状。
+- **通话态只认 `callKind`**（`null|'audio'|'video'`），不从 `media` 推导 ——
+  视频通话里关摄像头，仍然是通话中。
+
+### 图标
+
+网站图标与 launcher 图标是**两套脚本、同一份 SVG 底稿**：
+
+```bash
+node tools/gen-web-icons.mjs            # → public/icon-192/512/maskable-512/apple-touch-icon.png
+node android/tools/gen-icons.mjs        # → android/app/src/main/res/mipmap-*/ic_launcher*.png
+```
+
+两边都走 **CDP 截图**（Chrome 153 的 `--screenshot` 会静默失效）。
+⚠ 冷启动可能超过 15 秒，脚本里的等待窗口给到了 40 秒 —— 报「端口没起来」先别改代码，
+手动起一次 Chrome 确认端口是通的。
+
+> 各自的临时工作区（`tools/.webicon-work/`、`android/tools/.icon-work/`）和
+> `android/.kotlin/` 都已被 `.gitignore` 排除。

@@ -9,13 +9,29 @@
 <meta name="description" content="和对方约定一串口令，输入即接通。文字、语音、视频点对点直达，服务器不经手、不存储。">
 <title>暗号 · 口令通话</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Cpath d='M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z' fill='%23fff' opacity='.92'/%3E%3Ccircle cx='43' cy='24' r='7' fill='none' stroke='%23fff' stroke-width='3.4'/%3E%3Cpath d='M43 31v6' stroke='%23fff' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="app.css?v=20261009e">
+
+<!-- 桌面图标 / 清单 -->
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#2f6df6">
+
+<!--
+  ⚠ 这里**故意没有** <meta name="apple-mobile-web-app-capable">：
+     加上它，iOS 会把「添加到主屏幕」的图标当独立应用跑（standalone），
+     而 WebKit 的独立模式**拿不到摄像头** —— 用户装完点开会发现视频没画面，
+     还完全不知道为什么。清单里的 display 也相应写成 "browser"。
+
+     所以 iOS 的用法是：图标照加，点开仍然落在 Safari 里。Safari 里权限是通的。
+     （安卓侧不受影响：那边走的是真安装包。）
+-->
+
+<link rel="stylesheet" href="app.css?v=20261011a">
 <!-- 让 app.js 和样式并行下载：它在 body 末尾，不提示的话要等 HTML 解析到才发起请求。
      ⚠ preload 的 href 必须和下面 <script> 的 src **逐字一致（含 ?v=）**，
        否则等于白下两份。
      ⚠ 改了 app.js / app.css，就把这个 ?v= 一起改掉（随意换个值即可）：
        URL 一变缓存立刻失效，用户永远不会拿到「新页面 + 旧脚本」的混搭。 -->
-<link rel="preload" href="app.js?v=20261009e" as="script">
+<link rel="preload" href="app.js?v=20261011a" as="script">
 </head>
 <body>
 
@@ -42,6 +58,27 @@
   </form>
 
   <footer class="page-foot">
+    <!-- 装到手机上。收进 <details> 的理由同下面的自测入口：首屏只留「输口令」一件事。
+
+         ⚠ 发新版本时，把下面 dl-d 里的版本号与体积一起改掉。
+         ⚠ 安装包放在 public/roomtalk.apk，由 Assets 直接发（不进 Worker、不计费）；
+            MIME 与缓存策略在 _headers 里写死，改文件名的话那边也要改。 -->
+    <details class="getapp">
+      <summary>装到手机上</summary>
+      <div class="getapp-body">
+        <a class="dl" href="roomtalk.apk" download="roomtalk.apk">
+          <span class="dl-t">安卓手机</span>
+          <span class="dl-d">下载安装包（.apk）· v1.0.0 · 11 MB · 安卓 7.0 以上</span>
+        </a>
+
+        <div class="ios">
+          <p class="ios-t">iPhone / iPad</p>
+          <p>用 <b>Safari</b> 打开本页，点底部「分享」→「添加到主屏幕」，桌面上就多一个图标。</p>
+          <p class="ios-warn">一定要按上面这个办法装，别用别的「网页转应用」工具：iOS 的独立网页应用<b>拿不到摄像头</b>，视频通话会没有画面。我们因此刻意没开独立模式 —— 点开图标仍然落在 Safari 里，权限才是通的。</p>
+        </div>
+      </div>
+    </details>
+
     <!-- 自测入口：收在 <details> 里，首屏仍然只有「输口令」一件事。
          出问题的人自己会展开，不出问题的人不会被它挡视线。
          这两个站是纯前端检测页，专门用来把「浏览器/系统没放权限」和
@@ -245,6 +282,6 @@
 
 <div id="toast" class="toast" hidden role="status"></div>
 
-<script src="app.js?v=20261009e"></script>
+<script src="app.js?v=20261011a"></script>
 </body>
 </html>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 前后摄像头切换。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M20,5h-3.17L15,3H9L7.17,5H4c-1.1,0 -2,0.9 -2,2v12c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V7c0,-1.1 -0.9,-2 -2,-2zM12,18c-2.76,0 -5,-2.24 -5,-5H4.5l2.75,-3 2.75,3H7c0,2.76 2.24,5 5,5v-3l3.25,3.5L12,21v-3zM17,13c0,-2.76 -2.24,-5 -5,-5v3L8.75,7.5 12,4v3c2.76,0 5,2.24 5,5h2.5l-2.75,3 -2.75,-3H17z" />
+</vector>

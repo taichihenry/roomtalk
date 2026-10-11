@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  来电浮层。压在房间页之上、通话页之下。
+
+  ⚠ 「接听」这个动作本身就是用户的授权手势 —— 只有点了它才会真正打开麦克风，
+    这也是为什么浮层上必须把「接听后才会打开你的麦克风」写清楚。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#CC000000"
+    android:clickable="true"
+    android:focusable="true"
+    android:visibility="gone">
+
+    <LinearLayout
+        android:layout_width="300dp"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@drawable/bg_surface"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:paddingStart="24dp"
+        android:paddingTop="28dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="24dp">
+
+        <View
+            android:layout_width="72dp"
+            android:layout_height="72dp"
+            android:background="@drawable/bg_avatar" />
+
+        <TextView
+            android:id="@+id/ringName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:textColor="@color/text"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/ringTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center"
+            android:text="@string/ring_audio"
+            android:textColor="@color/text"
+            android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center"
+            android:text="@string/ring_sub"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="22dp"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:id="@+id/ringReject"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:layout_marginEnd="26dp"
+                android:background="@drawable/bg_call_btn_danger"
+                android:clickable="true"
+                android:contentDescription="@string/reject"
+                android:focusable="true"
+                android:padding="17dp"
+                android:src="@drawable/ic_hangup" />
+
+            <ImageView
+                android:id="@+id/ringAccept"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:background="@drawable/bg_call_btn_ok"
+                android:clickable="true"
+                android:contentDescription="@string/accept"
+                android:focusable="true"
+                android:padding="17dp"
+                android:src="@drawable/ic_call" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

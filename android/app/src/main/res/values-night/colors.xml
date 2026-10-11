@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色：跟着系统走（Theme.AppCompat.DayNight） -->
+    <color name="bg">#101114</color>
+    <color name="surface">#1A1C21</color>
+    <color name="surface2">#24272E</color>
+    <color name="text">#F2F4F8</color>
+    <color name="muted">#9BA3B0</color>
+    <color name="line">#2E3239</color>
+    <color name="primary">#4C84FF</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="danger">#E06B66</color>
+    <color name="ok">#3FBF7F</color>
+
+    <color name="ic_launcher_background">#2F6DF6</color>
+</resources>

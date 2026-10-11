@@ -1,0 +1,18 @@
+# 本机路径与构建产物不入库
+local.properties
+.gradle/
+build/
+app/build/
+*.iml
+.idea/
+.cxx/
+.kotlin/
+
+# 图标生成脚本的临时工作区（Chrome 用户目录、中间 HTML/PNG）
+tools/.icon-work/
+
+# ⚠ 签名密钥绝不入库。丢了它就无法给已发布的 App 出升级包，
+#    泄漏它等于任何人都能冒名发布「口令通话」的更新。
+keystore/
+*.jks
+*.keystore

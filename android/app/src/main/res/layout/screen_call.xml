@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  全屏通话页。
+
+  为什么是「盖在房间页上」而不是「替换房间页」：挂断后要能原样回到聊到一半的消息流，
+  重建一遍列表既费事又会丢滚动位置。
+
+  两块画布（big/small）是**一直在的**，大小窗互换只换轨道、不动布局（见 PeerEngine.applyStage）。
+  纯语音通话时整块 videoStage 直接隐藏，换成中间那个头像占位。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/callRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF000000">
+
+    <!-- 视频舞台 -->
+    <FrameLayout
+        android:id="@+id/videoStage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <!-- 铺满整屏的那块（默认放对方，点一下换成自己） -->
+        <org.webrtc.SurfaceViewRenderer
+            android:id="@+id/renderBig"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!--
+          角落小窗。⚠ 必须写在 renderBig **之后**：两块都是 SurfaceView，
+          层级按创建顺序排，写反了小窗会被大窗盖住。
+          尺寸与网页端一致（宽 32%，上限 150px）。这里用 dp 近似。
+        -->
+        <org.webrtc.SurfaceViewRenderer
+            android:id="@+id/renderSmall"
+            android:layout_width="104dp"
+            android:layout_height="150dp"
+            android:layout_gravity="top|end"
+            android:layout_marginTop="72dp"
+            android:layout_marginEnd="14dp" />
+    </FrameLayout>
+
+    <!-- 纯语音通话时的占位 -->
+    <LinearLayout
+        android:id="@+id/audioFace"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <View
+            android:layout_width="112dp"
+            android:layout_height="112dp"
+            android:background="@drawable/bg_avatar" />
+
+        <TextView
+            android:id="@+id/callPeerBig"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="22dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:paddingStart="32dp"
+            android:paddingEnd="32dp"
+            android:textColor="#FFFFFFFF"
+            android:textSize="22sp" />
+
+        <TextView
+            android:id="@+id/callStateText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/calling"
+            android:textColor="#B3FFFFFF"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <!-- 顶栏：谁 + 通话多久 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/bg_scrim_top"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="20dp"
+        android:paddingTop="18dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="26dp">
+
+        <TextView
+            android:id="@+id/callTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="#FFFFFFFF"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/callTimerTop"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:textColor="#CCFFFFFF"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <!-- 底部按钮排 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="@drawable/bg_scrim_bottom"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingTop="36dp"
+        android:paddingBottom="34dp">
+
+        <ImageView
+            android:id="@+id/btnMic"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="7dp"
+            android:layout_marginEnd="7dp"
+            android:background="@drawable/bg_call_btn"
+            android:clickable="true"
+            android:contentDescription="@string/mic"
+            android:focusable="true"
+            android:padding="16dp"
+            android:src="@drawable/ic_mic" />
+
+        <ImageView
+            android:id="@+id/btnCam"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="7dp"
+            android:layout_marginEnd="7dp"
+            android:background="@drawable/bg_call_btn"
+            android:clickable="true"
+            android:contentDescription="@string/cam"
+            android:focusable="true"
+            android:padding="16dp"
+            android:src="@drawable/ic_videocam" />
+
+        <!-- 只有探到第二颗摄像头才露（由代码控制） -->
+        <ImageView
+            android:id="@+id/btnFlip"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="7dp"
+            android:layout_marginEnd="7dp"
+            android:background="@drawable/bg_call_btn"
+            android:clickable="true"
+            android:contentDescription="@string/flip"
+            android:focusable="true"
+            android:padding="16dp"
+            android:src="@drawable/ic_flip"
+            android:visibility="gone" />
+
+        <ImageView
+            android:id="@+id/btnSpeaker"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="7dp"
+            android:layout_marginEnd="7dp"
+            android:background="@drawable/bg_call_btn"
+            android:clickable="true"
+            android:contentDescription="@string/speaker"
+            android:focusable="true"
+            android:padding="16dp"
+            android:src="@drawable/ic_volume" />
+
+        <ImageView
+            android:id="@+id/btnHangup"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="7dp"
+            android:layout_marginEnd="7dp"
+            android:background="@drawable/bg_call_btn_danger"
+            android:clickable="true"
+            android:contentDescription="@string/hangup"
+            android:focusable="true"
+            android:padding="16dp"
+            android:src="@drawable/ic_hangup" />
+    </LinearLayout>
+</FrameLayout>

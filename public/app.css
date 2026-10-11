@@ -334,6 +334,90 @@ button { cursor: pointer; }
 
 .selftest-tip { font-size: 11.5px; }
 
+/* ---------------------------------------------------------------------------
+   首页的「装到手机上」（展开式）
+   和自测入口一样的取舍：收进 <details>，首屏仍然只有「输口令」一件事。
+   想装的人自己会展开，不装的人不会被它挡住。
+
+   iOS 那一格是本块的重点：我们刻意**没开**独立模式（见 index.html 的说明），
+   所以文案必须把「一定要在 Safari 里打开」讲清楚 —— 讲不清的话，用户装完
+   点开会发现视频没画面，却不知道为什么。
+   --------------------------------------------------------------------------- */
+.getapp {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.getapp > summary {
+  padding: 10px 14px;
+  font-size: 12.5px;
+  color: var(--muted);
+  text-align: center;
+  cursor: pointer;
+  list-style: none;                 /* 去掉系统三角，改用下面的 ::before */
+}
+.getapp > summary::-webkit-details-marker { display: none; }
+.getapp > summary::before { content: '▸ '; }
+.getapp[open] > summary {
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+}
+.getapp[open] > summary::before { content: '▾ '; }
+.getapp > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.getapp-body { padding: 12px 14px 14px; }
+
+/* 安卓那一格：整块可点，做成主按钮 */
+.getapp .dl {
+  display: block;
+  padding: 12px 14px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-ink);
+  text-align: center;
+  text-decoration: none;
+  transition: filter .15s;
+}
+.getapp .dl:hover { filter: brightness(1.06); }
+.getapp .dl-t { display: block; font-size: 14px; font-weight: 600; }
+.getapp .dl-d { display: block; margin-top: 3px; font-size: 11.5px; opacity: .85; }
+
+/* iOS 那一格：只说明怎么装，不给按钮 —— 装法在 Safari 里，站点无法代劳 */
+.getapp .ios {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.getapp .ios p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
+}
+.getapp .ios p:last-child { margin-bottom: 0; }
+.getapp .ios b { color: var(--text); font-weight: 600; }
+.getapp .ios-t {
+  color: var(--text) !important;
+  font-size: 12.5px !important;
+  font-weight: 600;
+}
+/* 这条是「装错方式会没画面」的警告，用 warn 色把它从正文里拎出来 */
+.getapp .ios-warn {
+  padding-left: 9px;
+  border-left: 2px solid var(--warn);
+  color: var(--text) !important;
+}
+
 /* ============================ 房间 ============================ */
 
 .room {

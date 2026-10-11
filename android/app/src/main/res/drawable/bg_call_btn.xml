@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 通话界面那一排圆按钮：半透明深色底，压在视频画面上也不糊 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#66000000" />
+    <stroke android:width="1dp" android:color="#55FFFFFF" />
+</shape>

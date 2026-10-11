@@ -52,3 +52,37 @@
 
 /app.css
   Cache-Control: public, max-age=600
+
+# ---------------------------------------------------------------------------
+# 安装包与清单
+#
+# 安装包的扩展名是 .apk，Assets 按扩展名猜不出 MIME（会退成
+# application/octet-stream），装上之后系统才能认。这里显式写死。
+#
+# 缓存策略故意是 no-store：文件名不带版本号，改成 max-age 的话，用户下次
+# 想升级还是会拿到旧包。安装包没人会反复下，这点带宽不值得省。
+#
+# ⚠ 清单的 .webmanifest 也一样：扩展名太新，别指望 Assets 猜得对，
+#   猜错成 octet-stream 浏览器会直接忽略整份清单（图标和名字就全没了）。
+# ---------------------------------------------------------------------------
+
+/roomtalk.apk
+  Content-Type: application/vnd.android.package-archive
+  Cache-Control: no-store
+
+/manifest.webmanifest
+  Content-Type: application/manifest+json
+  Cache-Control: public, max-age=600
+
+# 这些东西改了就要立刻生效，别让回访用户被钉在旧版本上
+/icon-192.png
+  Cache-Control: public, max-age=600
+
+/icon-512.png
+  Cache-Control: public, max-age=600
+
+/icon-maskable-512.png
+  Cache-Control: public, max-age=600
+
+/apple-touch-icon.png
+  Cache-Control: public, max-age=600
