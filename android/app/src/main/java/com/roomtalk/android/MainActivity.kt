@@ -1,6 +1,8 @@
 package com.roomtalk.android
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Gravity
@@ -13,9 +15,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
+import com.roomtalk.android.core.CrashLog
 import com.roomtalk.android.net.RoomSession
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
@@ -111,6 +115,11 @@ class MainActivity : AppCompatActivity(), RoomSession.Cb {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // ⚠ 第一件事就装崩溃兜底：越早装，能接住的崩溃越多。
+        //   这个 App 是网页下载安装的，没有应用商店的崩溃上报，用户也不会去开
+        //   USB 调试抓 logcat —— 自己不记下来，出事就真的什么都查不到。
+        CrashLog.install(this)
+
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
@@ -121,6 +130,9 @@ class MainActivity : AppCompatActivity(), RoomSession.Cb {
         session.cb = this
 
         resetToGate()
+
+        // 上次崩过？把堆栈摆出来。这是唯一能让用户「把崩溃原因交出来」的通道。
+        CrashLog.last(this)?.let { showCrashDialog(it) }
     }
 
     override fun onDestroy() {
@@ -369,6 +381,36 @@ class MainActivity : AppCompatActivity(), RoomSession.Cb {
         toastView.isVisible = true
         toastView.removeCallbacks(toastHide)
         toastView.postDelayed(toastHide, 2600)
+    }
+
+    /**
+     * 把上一次的崩溃摆给用户看。
+     *
+     * 刻意用可选中 + 等宽的文本，并给一个「复制」按钮：要的是用户能**原样**
+     * 把这堆东西发出来。少一个字都可能丢线索（比如最上面那行异常类型）。
+     */
+    private fun showCrashDialog(text: String) {
+        val body = TextView(this).apply {
+            this.text = text
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(30, 24, 30, 24)
+        }
+        val scroll = ScrollView(this).apply { addView(body) }
+
+        AlertDialog.Builder(this)
+            .setTitle("上次启动时崩溃了")
+            .setMessage("把下面这段原样发出来，就能定位原因。")
+            .setView(scroll)
+            .setPositiveButton("复制") { _, _ ->
+                val cm = getSystemService(ClipboardManager::class.java)
+                cm?.setPrimaryClip(ClipData.newPlainText("roomtalk-crash", text))
+                showToast("已复制，发给我即可")
+            }
+            .setNeutralButton("清除") { _, _ -> CrashLog.clear(this) }
+            .setNegativeButton("先不管", null)
+            .show()
     }
 
     private fun sendCurrentMessage() {

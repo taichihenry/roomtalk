@@ -8,6 +8,17 @@
     <!-- 语音 / 视频通话 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!--
+      ⚠ MODIFY_AUDIO_SETTINGS 必须声明，否则通话音频路由会**静默失效**。
+         WebRTC 的音频设备模块（WebRtcAudioManager / WebRtcAudioTrack）会调
+         AudioManager.setMode(MODE_IN_COMMUNICATION) 和 setSpeakerphoneOn()。
+         AOSP 的 AudioService.checkAudioSettingsPermission() 在缺权限时**只记一条
+         warning 就返回 false**（不抛异常），所以症状不是崩溃，而是：
+           · 免提开关点了没反应、声音还在听筒里
+           · 音量键调的是「媒体音量」而不是「通话音量」
+         这种「不报错但功能是坏的」最难查 —— 因为 app 侧看不到任何异常。
+      -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- 通话时要保持屏幕与 CPU 醒着，否则息屏会把通话掐掉 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 

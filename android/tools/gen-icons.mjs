@@ -1,18 +1,24 @@
 /**
- * 生成 Android 启动图标（各密度 PNG + 自适应图标的前景矢量）。
+ * 生成 Android 启动图标（各密度 PNG + 自适应图标的前景 PNG）。
  * ---------------------------------------------------------------------------
- * 为什么用无头 Chrome 而不是画图库：网站的 favicon 就是一段内联 SVG，直接用
- * 浏览器把它渲成 PNG，图形与网站**逐像素一致**，也不用引入任何图形库依赖
- * （本机没有 Pillow / sharp）。
+ * 图案是白色的「8.中国」大字，底色沿用 #2f6df6（与网站 favicon 同一个蓝）。
+ *
+ * 为什么用无头 Chrome 而不是画图库：本机没有 Pillow / sharp，而要让中文字形
+ * 正确成型就必须有字体引擎。直接让浏览器渲染，字形和排版问题一次性解决，
+ * 也不用引入任何图形库依赖。
  *
  * ⚠ 不能用 `chrome --headless --screenshot=...`：这一份便携版 Chrome（153）
  *   会把截图请求交给已存在的实例、自己立刻以 0 退出，**一个文件都不写、还不报错**。
  *   所以走 CDP（和 test/e2e.mjs 同一条路），由我们自己拿 base64 落盘。
  *
+ * ⚠ 字号不是拍脑袋定的：先在页面里用 getBBox() 量出文字的真实外框，再反算
+ *   缩放 —— 中文字形的高度和西文数字差很多，写死 font-size 一定会一边溢出、
+ *   一边留白。这一点在自适应图标上更要命（见下）。
+ *
  * 用法： node android/tools/gen-icons.mjs
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,7 +27,15 @@ for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_
   delete process.env[k];
 }
 
-const CHROME = process.env.CHROME || 'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe';
+const CHROME_CANDIDATES = [
+  'E:/softs/vpn/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+];
+const CHROME = process.env.CHROME
+  || CHROME_CANDIDATES.find((p) => existsSync(p))
+  || CHROME_CANDIDATES[0];
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RES = join(HERE, '..', 'app', 'src', 'main', 'res');
 const WORK = join(HERE, '.icon-work');
@@ -29,27 +43,52 @@ const PORT = 9333;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* 与网站 favicon 完全相同的图形（语泡 + 圆圈带短柄），白描边、蓝底 */
-const GLYPH = `
-    <path d="M20 26a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H28l-6 5v-5a2 2 0 0 1-2-2z" fill="#fff"/>
-    <circle cx="43" cy="24" r="7" fill="none" stroke="#fff" stroke-width="3.4"/>
-    <path d="M43 31v6" stroke="#fff" stroke-width="3.4" stroke-linecap="round"/>`;
+/* ------------------------------ 设计参数 ------------------------------ */
 
-const VARIANTS = {
-  // 方形：与 favicon 一模一样
-  ic_launcher: `<rect width="64" height="64" rx="14" fill="#2f6df6"/>${GLYPH}`,
-  // 圆形：图形重心在 (35, 29.5)，圆底中心是 (32, 32)，平移回正中心
-  ic_launcher_round:
-    `<circle cx="32" cy="32" r="32" fill="#2f6df6"/><g transform="translate(-3 2.5)">${GLYPH}</g>`,
-};
+/** 底色的唯一出处 —— 必须与 values/colors.xml 的 ic_launcher_background 一致 */
+const BRAND = '#2f6df6';
+const TEXT = '8.中国';
 
-const DENSITIES = [
+/* 画布统一 108×108 视口（自适应图标的标准尺寸，legacy 图也按同一视口缩下去，
+   这样两套图的视觉重量是一致的，不用分别为它们调字号）。 */
+const VIEW = 108;
+
+/*
+ * 自适应图标（API 26+）的坑：系统会给图标套一个**只保证中间 72dp 可见**的遮罩，
+ * 外面那一圈随时可能被裁掉（圆形、方形、水滴形都可能）。所以前景不能铺满 108，
+ * 得缩进安全区里。外接矩形 62×26 正好能被 72 直径的圆装下：
+ *   (62/2)² + (26/2)² = 961 + 169 = 1130 ≤ 36² = 1296 ✓
+ */
+const SAFE_W = 62;
+const SAFE_H = 26;
+
+/* legacy 图标只有两种版式；字号上限在下面 fitText() 里按版式分别算，
+   中文字形的高度和西文数字差很多，写死 font-size 一定会一边溢出、一边留白。 */
+const VARIANTS = [
+  { file: 'ic_launcher', bg: 'roundRect' },       // 方形：老系统（API 24/25）直接用这张
+  { file: 'ic_launcher_round', bg: 'circle' },    // 圆形：内容和圆底一起出，字要退进圆里
+];
+
+/** legacy 图标：48dp 基准（就是 mipmap 的常规密度） */
+const LEGACY_DENSITIES = [
   ['mdpi', 48],
   ['hdpi', 72],
   ['xhdpi', 96],
   ['xxhdpi', 144],
   ['xxxhdpi', 192],
 ];
+
+/** 自适应前景：108dp 基准 */
+const FG_DENSITIES = [
+  ['mdpi', 108],
+  ['hdpi', 162],
+  ['xhdpi', 216],
+  ['xxhdpi', 324],
+  ['xxxhdpi', 432],
+];
+
+/** 中文优先的字体栈。取不到就退系统默认，字形不会缺，最多是字重差一点。 */
+const FONT = `"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Source Han Sans SC","SimHei",sans-serif`;
 
 /* ------------------------------ CDP 客户端 ------------------------------ */
 
@@ -92,11 +131,16 @@ class Cdp {
       this.ws.send(JSON.stringify({ id, method, params }));
     });
   }
+  async eval(expression) {
+    const r = await this.send('Runtime.evaluate', { expression, returnByValue: true });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || '页面里报错了');
+    return r.result && r.result.value;
+  }
 }
 
 /* --------------------------------- 主流程 -------------------------------- */
 
-/* ⚠ 这里刻意**不做** rmSync 清理：
+/* ⚠ 这里刻意**不做** rmSync 清理 work 目录：
    本机把 fs.rmSync 劫持到回收站工具上，递归删除会 ETIMEDOUT 直接抛错；
    改成「每次换一个唯一 profile 目录」，跑多少次都不会互相干扰，也不删任何东西。 */
 const PROFILE = join(WORK, 'profile-' + Date.now());
@@ -124,65 +168,115 @@ try {
     color: { r: 0, g: 0, b: 0, a: 0 },
   });
 
-  let n = 0;
-  for (const [density, size] of DENSITIES) {
-    const dir = join(RES, `mipmap-${density}`);
-    mkdirSync(dir, { recursive: true });
+  /** 渲染一段 SVG 并截成 PNG。 */
+  async function shoot(svgInner, size, outPath) {
+    const htmlPath = join(WORK, `shot-${Date.now()}-${Math.random().toString(36).slice(2)}.html`);
+    writeFileSync(htmlPath, `<!doctype html><meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}
+svg{display:block}</style>
+<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${VIEW} ${VIEW}">${svgInner}</svg>
+`, 'utf8');
+
     await cdp.send('Emulation.setDeviceMetricsOverride', {
       width: size, height: size, deviceScaleFactor: 1, mobile: false,
     });
+    await cdp.send('Page.navigate', { url: 'file:///' + htmlPath.replace(/\\/g, '/') });
+    for (let i = 0; i < 40; i++) {
+      if (await cdp.eval('document.readyState') === 'complete') break;
+      await sleep(50);
+    }
+    await sleep(60);   // 给渲染管线一帧的时间
 
-    for (const [name, inner] of Object.entries(VARIANTS)) {
-      const htmlPath = join(WORK, `${name}-${size}.html`);
-      writeFileSync(htmlPath, `<!doctype html><meta charset="utf-8">
-<style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}
-svg{display:block}</style>
-<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 64 64">${inner}</svg>
-`, 'utf8');
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(outPath, Buffer.from(shot.data, 'base64'));
+  }
 
-      await cdp.send('Page.navigate', { url: 'file:///' + htmlPath.replace(/\\/g, '/') });
-      // 内联 SVG 没有外部资源，等 readyState 就够了；不用事件是为了少一套监听
-      for (let i = 0; i < 40; i++) {
-        const r = await cdp.send('Runtime.evaluate', { expression: 'document.readyState' });
-        if (r.result && r.result.value === 'complete') break;
-        await sleep(50);
-      }
-      await sleep(60);   // 给渲染管线一帧的时间
+  /**
+   * 量出文字的真实外框，反算「缩放 + 平移」，让它在视口里既占满上限、又正好居中。
+   *
+   * ⚠ 必须先量后画，不能边画边量：`getBBox()` 给的是**未变换**的本地坐标，
+   *   在同一页上量两次会把上一次的缩放乘进去，越缩越小。
+   *   而且视口固定是 108×108，与输出像素无关 —— 所以每个变体**只量一次**就够，
+   *   各密度复用同一个 transform，不会出现「小图上字大、大图上字小」。
+   */
+  async function fitText(maxW, maxH) {
+    await shoot(`<text id="t" x="0" y="0" font-family='${FONT}' font-weight="900"
+      font-size="48" letter-spacing="0">${TEXT}</text>`, 216, join(WORK, 'probe.png'));
 
-      const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
-      writeFileSync(join(dir, `${name}.png`), Buffer.from(shot.data, 'base64'));
+    const b = await cdp.eval(`(() => {
+      const t = document.getElementById('t');
+      const r = t.getBBox();
+      return { x: r.x, y: r.y, w: r.width, h: r.height };
+    })()`);
+    if (!b || !(b.w > 0) || !(b.h > 0)) throw new Error('量不到文字外框（字体没加载？）');
+
+    const s = Math.min(maxW / b.w, maxH / b.h);
+    const tx = VIEW / 2 - (b.x + b.w / 2) * s;
+    const ty = VIEW / 2 - (b.y + b.h / 2) * s;
+    return {
+      attr: `transform="translate(${tx.toFixed(3)} ${ty.toFixed(3)}) scale(${s.toFixed(4)})"`,
+      w: b.w * s,
+      h: b.h * s,
+    };
+  }
+
+  function textEl(color, transform) {
+    return `<text id="t" x="0" y="0" ${transform} fill="${color}" font-family='${FONT}'
+      font-weight="900" font-size="48" letter-spacing="0">${TEXT}</text>`;
+  }
+
+  /* ---------- ① 先算出三种版式各自该用多大的字 ---------- */
+  const fitLegacy = await fitText(84, 40);   // 方形 legacy：边角有圆角，四边留够
+  const fitRound = await fitText(74, 34);    // 圆形 legacy：字要退进圆里
+  const fitFg = await fitText(SAFE_W, SAFE_H); // 自适应前景：必须落在 72dp 安全圆内
+
+  const reportLines = [
+    `方形 legacy : ${fitLegacy.w.toFixed(1)}×${fitLegacy.h.toFixed(1)}`,
+    `圆形 legacy : ${fitRound.w.toFixed(1)}×${fitRound.h.toFixed(1)}`,
+    `自适应前景  : ${fitFg.w.toFixed(1)}×${fitFg.h.toFixed(1)}（安全区 ${SAFE_W}×${SAFE_H}）`,
+  ];
+
+  /* ---------- ② legacy 图标（方形 + 圆形），各密度一张 ---------- */
+  let n = 0;
+  for (const v of VARIANTS) {
+    const fit = v.bg === 'circle' ? fitRound : fitLegacy;
+    const bg = v.bg === 'circle'
+      ? `<circle cx="54" cy="54" r="54" fill="${BRAND}"/>`
+      : `<rect width="108" height="108" rx="24" fill="${BRAND}"/>`;
+
+    for (const [density, size] of LEGACY_DENSITIES) {
+      const dir = join(RES, `mipmap-${density}`);
+      mkdirSync(dir, { recursive: true });
+      await shoot(bg + textEl('#FFFFFF', fit.attr), size, join(dir, `${v.file}.png`));
       n++;
     }
   }
 
-  /* 自适应图标（API 26+）的前景矢量。
-     108dp 画布里只有中间 72dp 是安全区，图形按 1.6 倍放大并居中：
-     原重心 (35, 29.5) → (54, 54)。下面是逐点换算后的坐标，不是拍脑袋写的。 */
-  const FG = `<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M30 48.4a3.2 3.2 0 0 1 3.2-3.2h22.4a3.2 3.2 0 0 1 3.2 3.2v14.4a3.2 3.2 0 0 1-3.2 3.2H42.8l-9.6 8v-8a3.2 3.2 0 0 1-3.2-3.2z" />
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="5.44"
-        android:pathData="M66.8 45.2m-11.2 0a11.2 11.2 0 1 0 22.4 0a11.2 11.2 0 1 0-22.4 0" />
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="5.44"
-        android:strokeLineCap="round"
-        android:pathData="M66.8 56.4v9.6" />
-</vector>
-`;
-  mkdirSync(join(RES, 'drawable'), { recursive: true });
-  writeFileSync(join(RES, 'drawable', 'ic_launcher_foreground.xml'), FG, 'utf8');
+  /* ---------- ③ 自适应图标的前景（透明底，只有白字） ----------
+   * 这里刻意输出**位图**而不是矢量：矢量里没法直接写字，要写字就得先把字形
+   * 转成 path，那就得引一个字体描边提取器。位图在自适应图标里是完全合法的
+   * 前景类型（系统按密度取对应那一张），省掉一整条工具链。
+   */
+  for (const [density, size] of FG_DENSITIES) {
+    const dir = join(RES, `drawable-${density}`);
+    mkdirSync(dir, { recursive: true });
+    await shoot(textEl('#FFFFFF', fitFg.attr), size, join(dir, 'ic_launcher_foreground.png'));
+    n++;
+  }
 
+  /* ---------- ④ 清掉旧的矢量前景 ----------
+     同名资源不能同时存在于 drawable/ 与 drawable-<density>/：AGP 会当成
+     重复资源报错。旧的图形（语泡 + 圆圈）也不再需要了。 */
+  const oldVector = join(RES, 'drawable', 'ic_launcher_foreground.xml');
+  if (existsSync(oldVector)) {
+    rmSync(oldVector);
+    reportLines.push('已删除旧矢量前景 drawable/ic_launcher_foreground.xml');
+  }
+
+  /* ---------- ⑤ 自适应图标的 XML（引用没变，只是前景换成了位图） ---------- */
   const anydpi = join(RES, 'mipmap-anydpi-v26');
   mkdirSync(anydpi, { recursive: true });
-  for (const name of Object.keys(VARIANTS)) {
+  for (const name of ['ic_launcher', 'ic_launcher_round']) {
     writeFileSync(join(anydpi, `${name}.xml`), `<?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
@@ -191,7 +285,64 @@ svg{display:block}</style>
 `, 'utf8');
   }
 
-  console.log(`已生成 ${n} 个 PNG + 自适应图标矢量`);
+  /* ---------- ⑥ 人眼复核图：启动器实际会把它裁成什么样 ----------
+   * 自适应图标的遮罩是**系统**套的（圆、方、水滴……各家不同），我们在代码里
+   * 看不到最终效果。所以把「圆形遮罩 / 方形遮罩 / 老系统的两张」并排画出来，
+   * 落在 docs/ 下给人看一眼 —— 和 docs/shot-call-*.png 一样，只作复核、不参与断言。
+   *
+   * ⚠ 这张图最该看的是「自适应那两格的字比老系统那两格小一圈」—— 那是安全区
+   *   的代价，不是 bug。用 84 的宽度去填满 108，圆形遮罩会直接把「8」和「国」切掉。
+   */
+  const TILE = 132;
+  const GAP = 18;
+  const W = GAP + 4 * (TILE + GAP);
+  const H = TILE + 2 * GAP + 30;
+  const scale = TILE / VIEW;
+
+  function tile(i, shape, fit, label) {
+    const x = GAP + i * (TILE + GAP);
+    const bg = shape === 'circle'
+      ? `<circle cx="54" cy="54" r="54" fill="${BRAND}"/>`
+      : `<rect width="108" height="108" rx="24" fill="${BRAND}"/>`;
+    return `<g transform="translate(${x} ${GAP}) scale(${scale})">
+      ${bg}${textEl('#FFFFFF', fit.attr)}
+    </g>
+    <text x="${x + TILE / 2}" y="${GAP + TILE + 20}" fill="#8a93a5" font-size="13"
+      font-family='${FONT}' text-anchor="middle">${label}</text>`;
+  }
+
+  const preview = [
+    tile(0, 'circle', fitFg, '圆形遮罩（多数启动器）'),
+    tile(1, 'squircle', fitFg, '方形遮罩'),
+    tile(2, 'squircle', fitLegacy, '老系统方形（API 24/25）'),
+    tile(3, 'circle', fitRound, '老系统圆形'),
+  ].join('');
+
+  const docsDir = join(HERE, '..', '..', 'docs');
+  mkdirSync(docsDir, { recursive: true });
+  const previewPath = join(docsDir, 'icon-preview.png');
+  {
+    const htmlPath = join(WORK, `preview-${Date.now()}.html`);
+    writeFileSync(htmlPath, `<!doctype html><meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:#101114;overflow:hidden}svg{display:block}</style>
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${preview}</svg>
+`, 'utf8');
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: W, height: H, deviceScaleFactor: 2, mobile: false,
+    });
+    await cdp.send('Page.navigate', { url: 'file:///' + htmlPath.replace(/\\/g, '/') });
+    for (let i = 0; i < 40; i++) {
+      if (await cdp.eval('document.readyState') === 'complete') break;
+      await sleep(50);
+    }
+    await sleep(80);
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(previewPath, Buffer.from(shot.data, 'base64'));
+    reportLines.push(`复核图：docs/icon-preview.png`);
+  }
+
+  console.log(`已生成 ${n} 张 PNG —— 内容「${TEXT}」，底色 ${BRAND}`);
+  for (const line of reportLines) console.log('  ' + line);
 } finally {
   // Chrome 是「启动器即退」，不能用 proc.kill()，得走 CDP 关
   try { await cdp?.send('Browser.close'); } catch { /* noop */ }

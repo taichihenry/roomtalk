@@ -17,7 +17,7 @@
  * 用法： node tools/gen-web-icons.mjs
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,7 +26,17 @@ for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_
   delete process.env[k];
 }
 
-const CHROME = process.env.CHROME || 'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe';
+/* 便携版 Chrome 挪过窝（E:/softs → E:/softs/vpn），按候选表探测，别写死一个路径。
+   CHROME 环境变量仍可覆盖。 */
+const CHROME_CANDIDATES = [
+  'E:/softs/vpn/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+];
+const CHROME = process.env.CHROME
+  || CHROME_CANDIDATES.find((p) => existsSync(p))
+  || CHROME_CANDIDATES[0];
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = join(HERE, '..', 'public');
 const WORK = join(HERE, '.webicon-work');

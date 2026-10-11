@@ -33,8 +33,8 @@ android {
         applicationId = "com.roomtalk.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         // WebRTC 的 .so 按架构各带一份，多一个架构就多几十 MB。
         // 只留两种主流 ARM：x86 平板与模拟器不覆盖（那本来也不是用户群）。
@@ -89,12 +89,75 @@ android {
         //
         // 我们这个包是挂在网站上让人用手机流量下的，**下载体积**比「安装时省那
         // 一秒」重要得多，所以打开传统打包让它们参与 zip 压缩。
-        // 实测能把这 23.5 MB 的包压到 14 MB 上下。
+        // 实测：debug 23.5 MB → release 11.17 MB（R8 + 资源收缩也各出一份力）。
         jniLibs {
             useLegacyPackaging = true
         }
     }
 }
+
+/*
+ * 每次构建都把签名密钥同步一份到本机备份目录。
+ *
+ * 为什么塞进构建里，而不是写成「记得手动抄一份」：
+ *   出包这一刻，密钥**一定在场、而且就是当前在用的那一把** —— 这是唯一一个
+ *   「不会忘」的时机。而丢了密钥的代价是**永久性**的：安卓靠签名一致判断
+ *   是不是同一个 App，换新密钥出的包系统会当成另一个 App、拒绝覆盖安装，
+ *   存量用户必须卸载重装（聊天记录一起清掉）。
+ *
+ * ⚠ 只复制，不删除：备份目录里可能有从别处恢复的文件，构建任务不该动它。
+ * ⚠ 备份目录不可用（外接盘没插 / 换了机器 / CI）时**只警告、绝不中断构建** ——
+ *   备份失败不该拦住出包。
+ */
+val keystoreDir = rootProject.file("keystore")
+val keystoreBackupDir = File("E:/密钥备份/" + rootProject.name.lowercase())
+
+tasks.register("backupSigningKey") {
+    group = "roomtalk"
+    description = "把 android/keystore 下的密钥与口令同步到 E:/密钥备份（只复制，不删除）"
+
+    doLast {
+        if (!keystoreDir.isDirectory) {
+            logger.lifecycle("[备份密钥] 没有 $keystoreDir，跳过")
+            return@doLast
+        }
+        try {
+            keystoreBackupDir.mkdirs()
+            var copied = 0
+            keystoreDir.listFiles()?.forEach { f ->
+                // 只往外抄真正的密钥材料。别的文件（临时文件、误放的截图）不碰 ——
+                // 备份目录是「最不该多东西」的地方。
+                val looksLikeKey = f.isFile && (
+                    f.name.endsWith(".jks") || f.name.endsWith(".keystore") ||
+                        f.name == "keystore.properties"
+                    )
+                if (!looksLikeKey) return@forEach
+
+                val out = File(keystoreBackupDir, f.name)
+                // 内容一致就不动它，避免每次构建都刷新文件时间戳
+                if (out.exists() && out.length() == f.length() &&
+                    out.readBytes().contentEquals(f.readBytes())
+                ) return@forEach
+
+                f.copyTo(out, overwrite = true)
+                copied++
+                logger.lifecycle("[备份密钥] 已更新 → $out")
+            }
+
+            val notes = File(keystoreBackupDir, "README-密钥说明.txt")
+            if (!notes.exists()) {
+                logger.warn("[备份密钥] ⚠ $notes 不存在，建议补一份恢复说明（指纹、别名、还原步骤）")
+            }
+            logger.lifecycle("[备份密钥] 完成：$keystoreBackupDir（本次更新 $copied 个文件）")
+        } catch (e: Exception) {
+            logger.warn("[备份密钥] ⚠ 备份失败，但**不影响本次构建**：${e.message}")
+        }
+    }
+}
+
+// 挂在 preBuild 上：assembleDebug / assembleRelease 都会先走它。
+// 用 matching 而不是 named，是为了在 AGP 版本变化、任务改名时不至于直接报错。
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn("backupSigningKey") }
 
 dependencies {
     // 版本尽量挑本机 Gradle 缓存里已有的，少一次下载就少一分构建失败的可能。

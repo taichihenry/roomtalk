@@ -18,7 +18,7 @@
    =========================================================================== */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +28,18 @@ for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_
   delete process.env[k];
 }
 
-const CHROME = 'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe';
+/* 便携版 Chrome 挪过窝（E:/softs → E:/softs/vpn），所以按候选表探测而不是写死。
+   ⚠ 写死一个路径的代价很大：Chrome 一挪，e2e 会以「Chrome 未能就绪」这种
+     跟代码毫无关系的错失败，白查半天。CHROME 环境变量仍可覆盖。 */
+const CHROME_CANDIDATES = [
+  'E:/softs/vpn/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'E:/softs/Chrome153_AllNew_2026.9.12/App/chrome.exe',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+];
+const CHROME = process.env.CHROME
+  || CHROME_CANDIDATES.find((p) => existsSync(p))
+  || CHROME_CANDIDATES[0];
 const ORIGIN = process.env.RT_ORIGIN || 'http://127.0.0.1:8787';
 const PASSPHRASE = 'e2e-' + Math.random().toString(36).slice(2, 10);
 

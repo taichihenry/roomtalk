@@ -124,6 +124,10 @@ class RoomSession(private val context: Context) {
     private val clientId = UUID.randomUUID().toString()
     private var started = false
 
+    /** 正在后台派生口令 / 建工厂。防止连点两次各起一套（会留下第二台 PeerConnection）。 */
+    @Volatile
+    private var entering = false
+
     private val name: String =
         (Build.MANUFACTURER?.takeIf { it.isNotBlank() }?.let { m -> "$m ${Build.MODEL}" } ?: Build.MODEL)
             .take(24)
@@ -131,25 +135,77 @@ class RoomSession(private val context: Context) {
     /* ============================== 对外操作 ============================== */
 
     fun enter(passphrase: String) {
-        room = RoomId.derive(passphrase)
-        started = true
-        remotePeerId = null
-        isHost = false
-        peerName = ""
-        engine.initFactory()
-        engine.onLocalSdp = { type, sdp -> sendSignalDescription(type, sdp) }
-        engine.onLocalIce = { c -> sendSignalCandidate(c) }
-        engine.onDcMessage = { text -> onDcMessage(text) }
-        engine.onDcOpen = { onChannelReady() }
-        engine.onRemoteTrack = { onRemoteTrack() }
-        engine.onConnectionChange = { st -> onConnState(st) }
+        if (entering) return
+        entering = true
+        cb?.status("正在进入…")
 
-        signaling = Signaling(
-            url = SIGNAL_URL,
-            onOpen = { onSignalOpen() },
-            onMessage = { m -> onServerMessage(m) },
-            onLost = { cb?.status("连接中断，正在重试…") },
-        ).also { it.start() }
+        /*
+         * ⚠ 这里有两件重活，一件都不能留在主线程上：
+         *   ① RoomId.derive —— PBKDF2 十万轮 HMAC-SHA256（和网页端算法逐位对齐，
+         *      轮数不能降）。Android 的 HmacSHA256 走 Conscrypt，每轮都是一次 JNI，
+         *      十万轮在低端机上能到几百毫秒甚至更久。
+         *   ② engine.initFactory —— EglBase + 采集线程 + 音频设备模块 + PeerConnectionFactory。
+         *
+         * 两件叠在一起放在主线程，输入点击就会被拖住；低端机能直接踩到 ANR 门槛
+         * （用户看到的就是「点一下进入就闪一下没了」）。所以派生挪后台，
+         * 建工厂仍在主线程（WebRTC 的 GL/音频初始化留在主线程更稳），但整体兜在
+         * try/catch 里 —— 失败要给得出话，而不是把一个闪退丢给用户。
+         */
+        Thread({
+            val roomId = try {
+                RoomId.derive(passphrase)
+            } catch (t: Throwable) {
+                Log.e(TAG, "口令派生失败", t)
+                main.post {
+                    entering = false
+                    cb?.backToGate("口令处理失败：${brief(t)}")
+                }
+                return@Thread
+            }
+
+            main.post {
+                // 后台算的这段时间里用户可能已经退出了
+                if (!entering) return@post
+                try {
+                    room = roomId
+                    started = true
+                    remotePeerId = null
+                    isHost = false
+                    peerName = ""
+
+                    engine.initFactory()
+                    engine.onLocalSdp = { type, sdp -> sendSignalDescription(type, sdp) }
+                    engine.onLocalIce = { c -> sendSignalCandidate(c) }
+                    engine.onDcMessage = { text -> onDcMessage(text) }
+                    engine.onDcOpen = { onChannelReady() }
+                    engine.onRemoteTrack = { onRemoteTrack() }
+                    engine.onConnectionChange = { st -> onConnState(st) }
+
+                    signaling = Signaling(
+                        url = SIGNAL_URL,
+                        onOpen = { onSignalOpen() },
+                        onMessage = { m -> onServerMessage(m) },
+                        onLost = { cb?.status("连接中断，正在重试…") },
+                    ).also { it.start() }
+                } catch (t: Throwable) {
+                    // 这里接住的都是 Java/Kotlin 层的失败（UnsatisfiedLinkError、
+                    // SecurityException、IllegalStateException…）。native 崩溃接不住，
+                    // 那类只能靠 CrashLog 留下的记录。
+                    Log.e(TAG, "进入房间失败", t)
+                    teardown()
+                    cb?.backToGate("进入房间失败：${brief(t)}")
+                } finally {
+                    entering = false
+                }
+            }
+        }, "rt-enter").start()
+    }
+
+    /** 把异常压成一行人话，够用户转述、也够我们定位类型。 */
+    private fun brief(t: Throwable): String {
+        val msg = t.message?.take(120)?.replace('\n', ' ')
+        val head = t.javaClass.simpleName
+        return if (msg.isNullOrBlank()) head else "$head: $msg"
     }
 
     /** 退出房间（顶栏 ✕）。通话中会先挂断，免得对方对着空房间干等。 */
@@ -754,6 +810,9 @@ class RoomSession(private val context: Context) {
 
     private fun teardown() {
         started = false
+        // 后台那趟「派生 + 建厂」还没回来时用户就退出了 —— 标记作废，
+        // 免得它回来之后又把信号连接建起来（用户已经不在房间页了）
+        entering = false
         cancelCallOutTimer()
         cancelPeerLeftTimer()
         stopTimer()
